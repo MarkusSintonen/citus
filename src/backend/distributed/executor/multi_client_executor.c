@@ -29,9 +29,14 @@
 #include <errno.h>
 #include <unistd.h>
 
+#ifdef HAVE_POLL_H
 #include <poll.h>
+#endif
 #ifdef HAVE_SYS_POLL_H
 #include <sys/poll.h>
+#endif
+#ifdef HAVE_SYS_SELECT_H
+#include <sys/select.h>
 #endif
 
 
@@ -816,8 +821,12 @@ MultiClientCreateWaitInfo(int maxConnections)
 	WaitInfo *waitInfo = palloc(sizeof(WaitInfo));
 
 	waitInfo->maxWaiters = maxConnections;
-	waitInfo->pollfds = palloc(maxConnections * sizeof(struct pollfd));
 
+	/* we use poll(2) if available, otherwise select(2) */
+#ifdef HAVE_POLL
+	waitInfo->pollfds = palloc(maxConnections * sizeof(struct pollfd));
+#else /* !HAVE_POLL */
+#endif
 	/* initialize remaining fields */
 	MultiClientResetWaitInfo(waitInfo);
 
@@ -832,6 +841,16 @@ MultiClientResetWaitInfo(WaitInfo *waitInfo)
 	waitInfo->registeredWaiters = 0;
 	waitInfo->haveReadyWaiter = false;
 	waitInfo->haveFailedWaiter = false;
+
+#ifdef HAVE_POLL
+#else
+	FD_ZERO(&(waitInfo->readFileDescriptorSet));
+	FD_ZERO(&(waitInfo->writeFileDescriptorSet));
+	FD_ZERO(&(waitInfo->exceptionFileDescriptorSet));
+
+	waitInfo->maxConnectionFileDescriptor = 0;
+#endif
+
 }
 
 
@@ -839,7 +858,11 @@ MultiClientResetWaitInfo(WaitInfo *waitInfo)
 void
 MultiClientFreeWaitInfo(WaitInfo *waitInfo)
 {
+#ifdef HAVE_POLL
 	pfree(waitInfo->pollfds);
+#else
+#endif
+
 	pfree(waitInfo);
 }
 
@@ -853,7 +876,11 @@ MultiClientRegisterWait(WaitInfo *waitInfo, TaskExecutionStatus executionStatus,
 						int32 connectionId)
 {
 	MultiConnection *connection = NULL;
+#ifdef HAVE_POLL
 	struct pollfd *pollfd = NULL;
+#else
+	int connectionFileDescriptor = 0;
+#endif
 
 	Assert(waitInfo->registeredWaiters < waitInfo->maxWaiters);
 
@@ -869,6 +896,7 @@ MultiClientRegisterWait(WaitInfo *waitInfo, TaskExecutionStatus executionStatus,
 	}
 
 	connection = ClientConnectionArray[connectionId];
+#ifdef HAVE_POLL
 	pollfd = &waitInfo->pollfds[waitInfo->registeredWaiters];
 	pollfd->fd = PQsocket(connection->pgConn);
 	if (executionStatus == TASK_STATUS_SOCKET_READ)
@@ -879,6 +907,26 @@ MultiClientRegisterWait(WaitInfo *waitInfo, TaskExecutionStatus executionStatus,
 	{
 		pollfd->events = POLLERR | POLLOUT;
 	}
+	
+#else
+	connectionFileDescriptor = PQsocket(connection->pgConn);
+	if (connectionFileDescriptor > waitInfo->maxConnectionFileDescriptor)
+	{
+		waitInfo->maxConnectionFileDescriptor = connectionFileDescriptor;
+	}
+
+	if (executionStatus == TASK_STATUS_SOCKET_READ)
+	{
+		FD_SET(connectionFileDescriptor, &(waitInfo->exceptionFileDescriptorSet));
+		FD_SET(connectionFileDescriptor, &(waitInfo->readFileDescriptorSet));
+	}
+	else if (executionStatus == TASK_STATUS_SOCKET_WRITE)
+	{
+		FD_SET(connectionFileDescriptor, &(waitInfo->exceptionFileDescriptorSet));
+		FD_SET(connectionFileDescriptor, &(waitInfo->writeFileDescriptorSet));
+	}
+#endif
+
 	waitInfo->registeredWaiters++;
 }
 
@@ -911,14 +959,26 @@ MultiClientWait(WaitInfo *waitInfo)
 	while (true)
 	{
 		/*
-		 * Wait for activity on any of the sockets. Limit the maximum time
-		 * spent waiting in one wait cycle, as insurance against edge
-		 * cases. For efficiency we don't want wake up quite as often as
-		 * citus.remote_task_check_interval, so rather arbitrarily sleep ten
-		 * times as long.
-		 */
+		* Wait for activity on any of the sockets. Limit the maximum time
+		* spent waiting in one wait cycle, as insurance against edge
+		* cases. For efficiency we don't want to wake quite as often as
+		* citus.remote_task_check_interval, so rather arbitrarily sleep ten
+		* times as long.
+		*/
+#ifdef HAVE_POLL
 		int rc = poll(waitInfo->pollfds, waitInfo->registeredWaiters,
 					  RemoteTaskCheckInterval * 10);
+#else
+		int maxConnectionFileDescriptor = waitInfo->maxConnectionFileDescriptor;
+		const int maxTimeout = RemoteTaskCheckInterval * 10 * 1000L;
+		struct timeval selectTimeout = { 0, maxTimeout };
+		
+		int rc = (select)(maxConnectionFileDescriptor + 1,
+			&(waitInfo->readFileDescriptorSet),
+			&(waitInfo->writeFileDescriptorSet),
+			&(waitInfo->exceptionFileDescriptorSet),
+			&selectTimeout);
+#endif
 
 		if (rc < 0)
 		{
@@ -963,6 +1023,8 @@ ClientConnectionReady(MultiConnection *connection,
 {
 	bool clientConnectionReady = false;
 	int pollResult = 0;
+	/* we use poll(2) if available, otherwise select(2) */
+#ifdef HAVE_POLL
 	int fileDescriptorCount = 1;
 	int immediateTimeout = 0;
 	int pollEventMask = 0;
@@ -982,6 +1044,32 @@ ClientConnectionReady(MultiConnection *connection,
 	pollFileDescriptor.revents = 0;
 
 	pollResult = poll(&pollFileDescriptor, fileDescriptorCount, immediateTimeout);
+#else
+	fd_set readFileDescriptorSet;
+	fd_set writeFileDescriptorSet;
+	fd_set exceptionFileDescriptorSet;
+	struct timeval immediateTimeout = { 0, 0 };
+	int connectionFileDescriptor = PQsocket(connection->pgConn);
+	
+	FD_ZERO(&readFileDescriptorSet);
+	FD_ZERO(&writeFileDescriptorSet);
+	FD_ZERO(&exceptionFileDescriptorSet);
+	
+	if (pollingStatus == PGRES_POLLING_READING)
+	{
+		FD_SET(connectionFileDescriptor, &exceptionFileDescriptorSet);
+		FD_SET(connectionFileDescriptor, &readFileDescriptorSet);
+	}
+	else if (pollingStatus == PGRES_POLLING_WRITING)
+	{
+		FD_SET(connectionFileDescriptor, &exceptionFileDescriptorSet);
+		FD_SET(connectionFileDescriptor, &writeFileDescriptorSet);
+	}
+	
+	pollResult = (select)(connectionFileDescriptor + 1, &readFileDescriptorSet,
+		&writeFileDescriptorSet, &exceptionFileDescriptorSet,
+		&immediateTimeout);
+#endif /* HAVE_POLL */
 
 	if (pollResult > 0)
 	{
@@ -1013,7 +1101,7 @@ ClientConnectionReady(MultiConnection *connection,
 			 */
 			Assert(errno == ENOMEM);
 			ereport(ERROR, (errcode_for_socket_access(),
-							errmsg("poll() failed: %m")));
+							errmsg("select()/poll() failed: %m")));
 		}
 	}
 

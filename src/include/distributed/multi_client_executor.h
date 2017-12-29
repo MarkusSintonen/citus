@@ -18,6 +18,15 @@
 #include "distributed/connection_management.h"
 #include "nodes/pg_list.h"
 
+#ifdef HAVE_POLL_H
+#include <poll.h>
+#endif
+#ifdef HAVE_SYS_POLL_H
+#include <sys/poll.h>
+#endif
+#ifdef HAVE_SYS_SELECT_H
+#include <sys/select.h>
+#endif
 
 #define INVALID_CONNECTION_ID -1  /* identifies an invalid connection */
 #define MAX_CONNECTION_COUNT 2048 /* simultaneous client connection count */
@@ -92,7 +101,14 @@ struct pollfd; /* forward declared, to avoid having to include poll.h */
 typedef struct WaitInfo
 {
 	int maxWaiters;
+#ifdef HAVE_POLL
 	struct pollfd *pollfds;
+#else
+	fd_set readFileDescriptorSet;
+	fd_set writeFileDescriptorSet;
+	fd_set exceptionFileDescriptorSet;
+	int maxConnectionFileDescriptor;
+#endif /* HAVE_POLL*/
 	int registeredWaiters;
 	bool haveReadyWaiter;
 	bool haveFailedWaiter;
