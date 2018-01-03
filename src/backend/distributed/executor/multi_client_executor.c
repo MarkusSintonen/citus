@@ -819,6 +819,12 @@ WaitInfo *
 MultiClientCreateWaitInfo(int maxConnections)
 {
 	WaitInfo *waitInfo = palloc(sizeof(WaitInfo));
+	const int MAX_WAIT_EVENT_COUNT = 50;
+
+	if (maxConnections > MAX_WAIT_EVENT_COUNT)
+	{
+		maxConnections = MAX_WAIT_EVENT_COUNT;
+	}
 
 	waitInfo->maxWaiters = maxConnections;
 
@@ -882,7 +888,11 @@ MultiClientRegisterWait(WaitInfo *waitInfo, TaskExecutionStatus executionStatus,
 	int connectionFileDescriptor = 0;
 #endif
 
-	Assert(waitInfo->registeredWaiters < waitInfo->maxWaiters);
+	/* This is to make sure we could never register more than maxWaiters in Windows */
+	if (waitInfo->registeredWaiters >= waitInfo->maxWaiters)
+	{
+		return;
+	}
 
 	if (executionStatus == TASK_STATUS_READY)
 	{
@@ -972,12 +982,12 @@ MultiClientWait(WaitInfo *waitInfo)
 		int maxConnectionFileDescriptor = waitInfo->maxConnectionFileDescriptor;
 		const int maxTimeout = RemoteTaskCheckInterval * 10 * 1000L;
 		struct timeval selectTimeout = { 0, maxTimeout };
-		
 		int rc = (select)(maxConnectionFileDescriptor + 1,
 			&(waitInfo->readFileDescriptorSet),
 			&(waitInfo->writeFileDescriptorSet),
 			&(waitInfo->exceptionFileDescriptorSet),
 			&selectTimeout);
+
 #endif
 
 		if (rc < 0)
@@ -985,8 +995,17 @@ MultiClientWait(WaitInfo *waitInfo)
 			/*
 			 * Signals that arrive can interrupt our poll(). In that case just
 			 * return. Every other error is unexpected and treated as such.
-			 */
-			if (errno == EAGAIN || errno == EINTR)
+			*/
+			int errorCode = errno;
+#ifdef WIN32
+			errorCode = WSAGetLastError();
+#endif
+
+			if (errorCode == 0)
+			{
+				return;
+			}
+			else if (errorCode == EAGAIN || errorCode == EINTR)
 			{
 				return;
 			}

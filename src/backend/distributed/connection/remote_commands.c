@@ -994,14 +994,19 @@ BuildWaitEventSet(MultiConnection **allConnections, int totalConnectionCount,
 	int pendingConnectionCount = totalConnectionCount - pendingConnectionsStartIndex;
 	WaitEventSet *waitEventSet = NULL;
 	int connectionIndex = 0;
+	const int MAX_WAIT_EVENT_COUNT = 50;
+
+	if (pendingConnectionCount > MAX_WAIT_EVENT_COUNT)
+	{
+		pendingConnectionCount = MAX_WAIT_EVENT_COUNT;
+	}
 
 	/* allocate pending connections + 2 for the signal latch and postmaster death */
 	waitEventSet = CreateWaitEventSet(CurrentMemoryContext, pendingConnectionCount + 2);
 
-	for (connectionIndex = pendingConnectionsStartIndex;
-		 connectionIndex < totalConnectionCount; connectionIndex++)
+	for (connectionIndex = 0; connectionIndex < pendingConnectionCount; connectionIndex++)
 	{
-		MultiConnection *connection = allConnections[connectionIndex];
+		MultiConnection *connection = allConnections[pendingConnectionsStartIndex + connectionIndex];
 		int socket = PQsocket(connection->pgConn);
 
 		/*
