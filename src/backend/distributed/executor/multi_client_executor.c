@@ -982,7 +982,15 @@ MultiClientWait(WaitInfo *waitInfo)
 		int maxConnectionFileDescriptor = waitInfo->maxConnectionFileDescriptor;
 		const int maxTimeout = RemoteTaskCheckInterval * 10 * 1000L;
 		struct timeval selectTimeout = { 0, maxTimeout };
-		int rc = (select)(maxConnectionFileDescriptor + 1,
+		int rc = 0;
+
+		/* it is not okay to call select when there is nothing to wait for */
+		if (waitInfo->registeredWaiters == 0)
+		{
+			return;
+		}
+
+		rc = (select)(maxConnectionFileDescriptor + 1,
 			&(waitInfo->readFileDescriptorSet),
 			&(waitInfo->writeFileDescriptorSet),
 			&(waitInfo->exceptionFileDescriptorSet),
