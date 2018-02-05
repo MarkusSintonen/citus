@@ -833,6 +833,7 @@ MultiClientCreateWaitInfo(int maxConnections)
 	waitInfo->pollfds = palloc(maxConnections * sizeof(struct pollfd));
 #else /* !HAVE_POLL */
 #endif
+
 	/* initialize remaining fields */
 	MultiClientResetWaitInfo(waitInfo);
 
@@ -856,7 +857,6 @@ MultiClientResetWaitInfo(WaitInfo *waitInfo)
 
 	waitInfo->maxConnectionFileDescriptor = 0;
 #endif
-
 }
 
 
@@ -917,7 +917,7 @@ MultiClientRegisterWait(WaitInfo *waitInfo, TaskExecutionStatus executionStatus,
 	{
 		pollfd->events = POLLERR | POLLOUT;
 	}
-	
+
 #else
 	connectionFileDescriptor = PQsocket(connection->pgConn);
 	if (connectionFileDescriptor > waitInfo->maxConnectionFileDescriptor)
@@ -969,12 +969,12 @@ MultiClientWait(WaitInfo *waitInfo)
 	while (true)
 	{
 		/*
-		* Wait for activity on any of the sockets. Limit the maximum time
-		* spent waiting in one wait cycle, as insurance against edge
-		* cases. For efficiency we don't want to wake quite as often as
-		* citus.remote_task_check_interval, so rather arbitrarily sleep ten
-		* times as long.
-		*/
+		 * Wait for activity on any of the sockets. Limit the maximum time
+		 * spent waiting in one wait cycle, as insurance against edge
+		 * cases. For efficiency we don't want to wake quite as often as
+		 * citus.remote_task_check_interval, so rather arbitrarily sleep ten
+		 * times as long.
+		 */
 #ifdef HAVE_POLL
 		int rc = poll(waitInfo->pollfds, waitInfo->registeredWaiters,
 					  RemoteTaskCheckInterval * 10);
@@ -990,11 +990,11 @@ MultiClientWait(WaitInfo *waitInfo)
 			return;
 		}
 
-		rc = (select)(maxConnectionFileDescriptor + 1,
-			&(waitInfo->readFileDescriptorSet),
-			&(waitInfo->writeFileDescriptorSet),
-			&(waitInfo->exceptionFileDescriptorSet),
-			&selectTimeout);
+		rc = (select) (maxConnectionFileDescriptor + 1,
+					   &(waitInfo->readFileDescriptorSet),
+					   &(waitInfo->writeFileDescriptorSet),
+					   &(waitInfo->exceptionFileDescriptorSet),
+					   &selectTimeout);
 
 #endif
 
@@ -1003,7 +1003,7 @@ MultiClientWait(WaitInfo *waitInfo)
 			/*
 			 * Signals that arrive can interrupt our poll(). In that case just
 			 * return. Every other error is unexpected and treated as such.
-			*/
+			 */
 			int errorCode = errno;
 #ifdef WIN32
 			errorCode = WSAGetLastError();
@@ -1050,6 +1050,7 @@ ClientConnectionReady(MultiConnection *connection,
 {
 	bool clientConnectionReady = false;
 	int pollResult = 0;
+
 	/* we use poll(2) if available, otherwise select(2) */
 #ifdef HAVE_POLL
 	int fileDescriptorCount = 1;
@@ -1077,11 +1078,11 @@ ClientConnectionReady(MultiConnection *connection,
 	fd_set exceptionFileDescriptorSet;
 	struct timeval immediateTimeout = { 0, 0 };
 	int connectionFileDescriptor = PQsocket(connection->pgConn);
-	
+
 	FD_ZERO(&readFileDescriptorSet);
 	FD_ZERO(&writeFileDescriptorSet);
 	FD_ZERO(&exceptionFileDescriptorSet);
-	
+
 	if (pollingStatus == PGRES_POLLING_READING)
 	{
 		FD_SET(connectionFileDescriptor, &exceptionFileDescriptorSet);
@@ -1092,10 +1093,10 @@ ClientConnectionReady(MultiConnection *connection,
 		FD_SET(connectionFileDescriptor, &exceptionFileDescriptorSet);
 		FD_SET(connectionFileDescriptor, &writeFileDescriptorSet);
 	}
-	
-	pollResult = (select)(connectionFileDescriptor + 1, &readFileDescriptorSet,
-		&writeFileDescriptorSet, &exceptionFileDescriptorSet,
-		&immediateTimeout);
+
+	pollResult = (select) (connectionFileDescriptor + 1, &readFileDescriptorSet,
+						   &writeFileDescriptorSet, &exceptionFileDescriptorSet,
+						   &immediateTimeout);
 #endif /* HAVE_POLL */
 
 	if (pollResult > 0)
