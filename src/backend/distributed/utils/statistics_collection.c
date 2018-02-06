@@ -25,7 +25,9 @@ PG_FUNCTION_INFO_V1(citus_server_id);
 #ifdef HAVE_LIBCURL
 
 #include <curl/curl.h>
+#ifndef WIN32
 #include <sys/utsname.h>
+#endif
 
 #include "access/xact.h"
 #include "distributed/metadata_cache.h"
@@ -92,10 +94,12 @@ CollectBasicUsageStatistics(void)
 	Datum metadataJsonbDatum = 0;
 	char *metadataJsonbStr = NULL;
 	MemoryContext savedContext = CurrentMemoryContext;
-	struct utsname unameData;
 	int unameResult PG_USED_FOR_ASSERTS_ONLY = 0;
 	bool metadataCollectionFailed = false;
+#ifndef WIN32
+	struct utsname unameData;
 	memset(&unameData, 0, sizeof(unameData));
+#endif
 
 	/*
 	 * Start a subtransaction so we can rollback database's state to it in case
@@ -145,20 +149,26 @@ CollectBasicUsageStatistics(void)
 		return false;
 	}
 
+#ifndef WIN32
 	unameResult = uname(&unameData);
 	Assert(unameResult == 0);  /* uname() always succeeds if we pass valid buffer */
+#endif
 
 	appendStringInfoString(fields, "{\"citus_version\": ");
 	escape_json(fields, CITUS_VERSION);
 	appendStringInfo(fields, ",\"table_count\": " UINT64_FORMAT, roundedDistTableCount);
 	appendStringInfo(fields, ",\"cluster_size\": " UINT64_FORMAT, roundedClusterSize);
 	appendStringInfo(fields, ",\"worker_node_count\": %u", workerNodeCount);
+#ifndef WIN32
 	appendStringInfoString(fields, ",\"os_name\": ");
 	escape_json(fields, unameData.sysname);
 	appendStringInfoString(fields, ",\"os_release\": ");
 	escape_json(fields, unameData.release);
 	appendStringInfoString(fields, ",\"hwid\": ");
 	escape_json(fields, unameData.machine);
+#else
+	appendStringInfoString(fields, ",\"os_name\": \"Windows\"");
+#endif
 	appendStringInfo(fields, ",\"node_metadata\": %s", metadataJsonbStr);
 	appendStringInfoString(fields, "}");
 
