@@ -27,6 +27,10 @@ cache:
 # Build worker image (VM template)
 image: Visual Studio 2017
 
+# save the cache even if the build fails
+environment:
+  APPVEYOR_SAVE_CACHE_ON_ERROR: true
+
 # scripts that are called at very beginning, before repo cloning
 init:
   - git config --global core.autocrlf input
