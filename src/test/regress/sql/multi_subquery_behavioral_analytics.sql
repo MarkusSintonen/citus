@@ -1818,6 +1818,60 @@ FROM
   ORDER BY 1,2
   LIMIT 5;
 
+-- top level aggregate with join alias
+SELECT
+	a.user_id, avg(b.value_2) as subquery_avg
+FROM
+	(SELECT user_id
+	FROM
+		users_table
+	WHERE
+		(value_1 > 2)
+	GROUP BY
+		user_id
+	HAVING
+		count(distinct value_1) > 2
+	) as a
+	LEFT JOIN
+	(SELECT
+		DISTINCT ON (value_2) value_2 , user_id, value_3
+	FROM
+		users_table
+	WHERE
+		(value_1 > 3)
+	ORDER BY
+		1,2,3
+	) AS b
+	USING (user_id)
+GROUP BY user_id;
+
+SELECT
+	a.user_id, avg(b.value_2) as subquery_avg
+FROM
+	(SELECT
+		user_id
+	FROM
+		users_table
+	WHERE
+		(value_1 > 2)
+	GROUP BY
+		user_id
+	HAVING
+		count(distinct value_1) > 2
+	) as a
+	LEFT JOIN
+	(SELECT
+		DISTINCT ON (value_2) value_2 , user_id, value_3
+	FROM
+		users_table
+	WHERE
+		(value_1 > 3)
+	ORDER BY
+		1,2,3
+	) AS b
+	USING (user_id)
+GROUP BY a.user_id;
+
 
 DROP FUNCTION test_join_function_2(integer, integer);
 
