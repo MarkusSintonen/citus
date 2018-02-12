@@ -162,6 +162,7 @@ static List * SublinkList(Query *originalQuery);
 static bool ExtractSublinkWalker(Node *node, List **sublinkList);
 static MultiNode * SubqueryPushdownMultiNodeTree(Query *queryTree);
 
+static void FixupDuplicateColumnRangeTableEntryReference(List *columnList, List *rteList);
 static List * CreateSubqueryTargetEntryList(List *columnList);
 static void UpdateVarMappingsForExtendedOpNode(List *columnList,
 											   List *subqueryTargetEntryList);
@@ -213,6 +214,7 @@ static bool
 ShouldUseSubqueryPushDown(Query *originalQuery, Query *rewrittenQuery)
 {
 	List *qualifierList = NIL;
+	StringInfo errorMessage = NULL;
 
 	/*
 	 * We check the existence of subqueries in FROM clause on the modified query
@@ -250,6 +252,13 @@ ShouldUseSubqueryPushDown(Query *originalQuery, Query *rewrittenQuery)
 	 */
 	qualifierList = QualifierList(rewrittenQuery->jointree);
 	if (DeferErrorIfUnsupportedClause(qualifierList) != NULL)
+	{
+		return true;
+	}
+
+	/* check if the query has a window function and it is safe to pushdown */
+	if (originalQuery->hasWindowFuncs &&
+		SafeToPushdownWindowFunction(originalQuery, &errorMessage))
 	{
 		return true;
 	}
@@ -817,8 +826,8 @@ DeferErrorIfCannotPushdownSubquery(Query *subqueryTree, bool outerMostQueryHasLi
 	 * We support window functions when the window function
 	 * is partitioned on distribution column.
 	 */
-	if (subqueryTree->windowClause && !SafeToPushdownWindowFunction(subqueryTree,
-																	&errorInfo))
+	if (subqueryTree->hasWindowFuncs && !SafeToPushdownWindowFunction(subqueryTree,
+																	  &errorInfo))
 	{
 		errorDetail = (char *) errorInfo->data;
 		preconditionsSatisfied = false;
@@ -2046,6 +2055,7 @@ DeferErrorIfQueryNotSupported(Query *queryTree)
 	bool hasComplexJoinOrder = false;
 	bool hasComplexRangeTableType = false;
 	bool preconditionsSatisfied = true;
+	StringInfo errorInfo = NULL;
 	const char *errorHint = NULL;
 	const char *joinHint = "Consider joining tables on partition column and have "
 						   "equal filter on joining columns.";
@@ -2064,15 +2074,16 @@ DeferErrorIfQueryNotSupported(Query *queryTree)
 		errorHint = filterHint;
 	}
 
-	if (queryTree->hasWindowFuncs)
+	if (queryTree->hasWindowFuncs &&
+		!SafeToPushdownWindowFunction(queryTree, &errorInfo))
 	{
 		preconditionsSatisfied = false;
 		errorMessage = "could not run distributed query because the window "
 					   "function that is used cannot be pushed down";
 		errorHint = "Window functions are supported in two ways. Either add "
 					"an equality filter on the distributed tables' partition "
-					"column or use the window functions inside a subquery with "
-					"a PARTITION BY clause containing the distribution column";
+					"column or use the window functions with a PARTITION BY "
+					"clause containing the distribution column";
 	}
 
 	if (queryTree->setOperations)
@@ -3102,6 +3113,8 @@ MultiExtendedOpNode(Query *queryTree)
 	extendedOpNode->havingQual = queryTree->havingQual;
 	extendedOpNode->distinctClause = queryTree->distinctClause;
 	extendedOpNode->hasDistinctOn = queryTree->hasDistinctOn;
+	extendedOpNode->hasWindowFuncs = queryTree->hasWindowFuncs;
+	extendedOpNode->windowClause = queryTree->windowClause;
 
 	return extendedOpNode;
 }
@@ -3363,7 +3376,8 @@ pull_var_clause_default(Node *node)
 	 * PVC_REJECT_PLACEHOLDERS is implicit if PVC_INCLUDE_PLACEHOLDERS
 	 * isn't specified.
 	 */
-	List *columnList = pull_var_clause(node, PVC_RECURSE_AGGREGATES);
+	List *columnList = pull_var_clause(node, PVC_RECURSE_AGGREGATES |
+									   PVC_RECURSE_WINDOWFUNCS);
 
 	return columnList;
 }
@@ -3735,6 +3749,8 @@ SubqueryPushdownMultiNodeTree(Query *queryTree)
 	havingClauseColumnList = pull_var_clause_default(queryTree->havingQual);
 	columnList = list_concat(targetColumnList, havingClauseColumnList);
 
+	FixupDuplicateColumnRangeTableEntryReference(columnList, queryTree->rtable);
+
 	/* create a target entry for each unique column */
 	subqueryTargetEntryList = CreateSubqueryTargetEntryList(columnList);
 
@@ -3799,6 +3815,91 @@ SubqueryPushdownMultiNodeTree(Query *queryTree)
 	currentTopNode = (MultiNode *) extendedOpNode;
 
 	return currentTopNode;
+}
+
+
+/*
+ * FixupDuplicateColumnRangeTableEntryReference iterates over provided
+ * columnList to identify multiple references of the same column that is used
+ * from a different range table entry.
+ *
+ * This is required because Postgres allows columns to be referenced using
+ * a join alias. Therefore the same column from a table could be referenced
+ * twice using its absolute table name (t1.a), and without table name (a).
+ * This is a problem when one of them is inside the group by clause and the
+ * other is not. Postgres is smart about it to detect that both target columns
+ * resolve to the same thing, and allows a single group by clause to cover
+ * both target entries. Here we want to find out the repetitions of the same
+ * column, if there are any, we use the column's first appearance's reference.
+ * We did this beacuse blindly converting join alias name to column reference
+ * breaks some nested queries with CTEs.
+ */
+static void
+FixupDuplicateColumnRangeTableEntryReference(List *columnList, List *rteList)
+{
+	ListCell *columnCell = NULL;
+	List *previousColumnList = NIL;
+
+	foreach(columnCell, columnList)
+	{
+		Var *column = (Var *) lfirst(columnCell);
+		RangeTblEntry *columnRte = NULL;
+		RangeTblEntry *previousColumnRte = NULL;
+		ListCell *previousColumnCell = NULL;
+		Var *foundColumn = NULL;
+
+		Assert(IsA(column, Var));
+
+		/*
+		 * Determine if we have seen this column previously. We use
+		 * the original column var (normalizedColumn) from relation RTE
+		 * to determine if two columns are equivalent. column and
+		 * normalizeColumn are essentially the same. They only differ
+		 * when a column belongs to a JOIN_RTE in which we use normalized
+		 * column for comparisons.
+		 */
+		foreach(previousColumnCell, previousColumnList)
+		{
+			Var *previousColumn = (Var *) lfirst(previousColumnCell);
+			Var *normalizedColumn = NULL;
+			Var *normalizedPreviousColumn = NULL;
+
+			columnRte = rt_fetch(column->varno, rteList);
+			normalizedColumn = column;
+			if (columnRte->rtekind == RTE_JOIN)
+			{
+				normalizedColumn = (Var *) list_nth(columnRte->joinaliasvars,
+													column->varattno - 1);
+			}
+
+			normalizedPreviousColumn = previousColumn;
+			previousColumnRte = rt_fetch(previousColumn->varno, rteList);
+			if (previousColumnRte->rtekind == RTE_JOIN)
+			{
+				normalizedPreviousColumn = (Var *) list_nth(
+					previousColumnRte->joinaliasvars, previousColumn->varattno - 1);
+			}
+
+			if (normalizedPreviousColumn->varno == normalizedColumn->varno &&
+				normalizedPreviousColumn->varattno == normalizedColumn->varattno)
+			{
+				foundColumn = previousColumn;
+				break;
+			}
+		}
+
+		if (foundColumn != NULL)
+		{
+			/* replace column varno/varattno values with referenced columns var */
+			column->varno = foundColumn->varno;
+			column->varattno = foundColumn->varattno;
+		}
+		else
+		{
+			/* add only new columns to previous column list */
+			previousColumnList = lappend(previousColumnList, column);
+		}
+	}
 }
 
 
