@@ -703,4 +703,70 @@ FROM (
 ORDER BY 2 DESC, 1 DESC
 LIMIT 5;
 
+-- window function at top level query
+SELECT
+	user_id, COUNT(*) OVER (PARTITION BY user_id, MIN(value_2))
+FROM
+	users_table
+GROUP BY
+	1
+ORDER BY
+	1, 2;
+
+SELECT
+	user_id, COUNT(*) OVER (PARTITION BY user_id, MIN(value_2))
+FROM (
+	SELECT
+		user_id, value_2, random() as r1
+	FROM
+		users_table
+	) s
+GROUP BY
+	1
+ORDER BY
+	1, 2;
+
+SELECT
+	us.user_id,
+	SUM(us.value_1) OVER (PARTITION BY us.user_id)
+FROM
+	users_table us
+JOIN
+	events_table ev
+ON (us.user_id = ev.user_id)
+GROUP BY
+	1,
+	value_1
+ORDER BY
+	1,
+	2
+LIMIT 5;
+
+WITH users_events AS
+(
+	SELECT
+		user_id
+	FROM
+		users_table
+)
+SELECT
+	uid,
+	event_type,
+	value_2,
+	value_3 
+FROM (
+	(SELECT
+		user_id as uid
+	FROM
+		users_events
+	) users
+	JOIN
+		events_table
+	ON
+		users.uid = events_table.event_type
+	) a
+ORDER BY
+	1,2,3,4
+LIMIT 5;
+
 DROP VIEW subq;
