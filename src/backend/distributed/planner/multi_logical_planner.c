@@ -162,7 +162,7 @@ static List * SublinkList(Query *originalQuery);
 static bool ExtractSublinkWalker(Node *node, List **sublinkList);
 static MultiNode * SubqueryPushdownMultiNodeTree(Query *queryTree);
 
-static void FixupDuplicateColumnRangeTableEntryReference(List *columnList, List *rteList);
+static void FlattenJoinVars(List *columnList, Query *queryTree);
 static List * CreateSubqueryTargetEntryList(List *columnList);
 static void UpdateVarMappingsForExtendedOpNode(List *columnList,
 											   List *subqueryTargetEntryList);
@@ -3749,7 +3749,7 @@ SubqueryPushdownMultiNodeTree(Query *queryTree)
 	havingClauseColumnList = pull_var_clause_default(queryTree->havingQual);
 	columnList = list_concat(targetColumnList, havingClauseColumnList);
 
-	FixupDuplicateColumnRangeTableEntryReference(columnList, queryTree->rtable);
+	FlattenJoinVars(columnList, queryTree);
 
 	/* create a target entry for each unique column */
 	subqueryTargetEntryList = CreateSubqueryTargetEntryList(columnList);
@@ -3819,9 +3819,9 @@ SubqueryPushdownMultiNodeTree(Query *queryTree)
 
 
 /*
- * FixupDuplicateColumnRangeTableEntryReference iterates over provided
- * columnList to identify multiple references of the same column that is used
- * from a different range table entry.
+ * FlattenJoinVars iterates over provided columnList to identify
+ * Var's that are referenced from join RTE, and reverts back to their
+ * original RTEs.
  *
  * This is required because Postgres allows columns to be referenced using
  * a join alias. Therefore the same column from a table could be referenced
@@ -3829,75 +3829,48 @@ SubqueryPushdownMultiNodeTree(Query *queryTree)
  * This is a problem when one of them is inside the group by clause and the
  * other is not. Postgres is smart about it to detect that both target columns
  * resolve to the same thing, and allows a single group by clause to cover
- * both target entries. Here we want to find out the repetitions of the same
- * column, if there are any, we use the column's first appearance's reference.
- * We did this beacuse blindly converting join alias name to column reference
- * breaks some nested queries with CTEs.
+ * both target entries. We want to make sure we provide correct varno/varattno
+ * values to Postgres so that it could produce valid query.
+ *
+ * Only exception is that, if a join is given an alias name, we do not want to
+ * flatten those var's.
+ *
  */
 static void
-FixupDuplicateColumnRangeTableEntryReference(List *columnList, List *rteList)
+FlattenJoinVars(List *columnList, Query *queryTree)
 {
 	ListCell *columnCell = NULL;
-	List *previousColumnList = NIL;
+	List *rteList = queryTree->rtable;
 
 	foreach(columnCell, columnList)
 	{
 		Var *column = (Var *) lfirst(columnCell);
 		RangeTblEntry *columnRte = NULL;
-		RangeTblEntry *previousColumnRte = NULL;
-		ListCell *previousColumnCell = NULL;
-		Var *foundColumn = NULL;
 
 		Assert(IsA(column, Var));
 
 		/*
-		 * Determine if we have seen this column previously. We use
-		 * the original column var (normalizedColumn) from relation RTE
-		 * to determine if two columns are equivalent. column and
-		 * normalizeColumn are essentially the same. They only differ
-		 * when a column belongs to a JOIN_RTE in which we use normalized
-		 * column for comparisons.
+		 * if join has an alias, it is copied over join rte. There is
+		 * no need to find the JoinExpr to check whether it has
+		 * an alias defined.
 		 */
-		foreach(previousColumnCell, previousColumnList)
+		columnRte = rt_fetch(column->varno, rteList);
+		if (columnRte->rtekind == RTE_JOIN && columnRte->alias == NULL)
 		{
-			Var *previousColumn = (Var *) lfirst(previousColumnCell);
-			Var *normalizedColumn = NULL;
-			Var *normalizedPreviousColumn = NULL;
+			PlannerInfo *root = makeNode(PlannerInfo);
+			Var *normalizedVar = NULL;
 
-			columnRte = rt_fetch(column->varno, rteList);
-			normalizedColumn = column;
-			if (columnRte->rtekind == RTE_JOIN)
-			{
-				normalizedColumn = (Var *) list_nth(columnRte->joinaliasvars,
-													column->varattno - 1);
-			}
+			root->parse = (queryTree);
+			root->planner_cxt = CurrentMemoryContext;
+			root->hasJoinRTEs = true;
 
-			normalizedPreviousColumn = previousColumn;
-			previousColumnRte = rt_fetch(previousColumn->varno, rteList);
-			if (previousColumnRte->rtekind == RTE_JOIN)
-			{
-				normalizedPreviousColumn = (Var *) list_nth(
-					previousColumnRte->joinaliasvars, previousColumn->varattno - 1);
-			}
+			normalizedVar = (Var *) flatten_join_alias_vars(root, (Node *) column);
 
-			if (normalizedPreviousColumn->varno == normalizedColumn->varno &&
-				normalizedPreviousColumn->varattno == normalizedColumn->varattno)
-			{
-				foundColumn = previousColumn;
-				break;
-			}
-		}
-
-		if (foundColumn != NULL)
-		{
-			/* replace column varno/varattno values with referenced columns var */
-			column->varno = foundColumn->varno;
-			column->varattno = foundColumn->varattno;
-		}
-		else
-		{
-			/* add only new columns to previous column list */
-			previousColumnList = lappend(previousColumnList, column);
+			/*
+			 * We need to copy values over existing one to make sure it is updated on
+			 * respective places.
+			 */
+			memcpy(column, normalizedVar, sizeof(Var));
 		}
 	}
 }
