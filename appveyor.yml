@@ -47,10 +47,9 @@ install:
   - flex --version
   - bison --version
   # make postgres think we're a contrib module
-  - git clone --depth 1 -b REL_10_STABLE https://github.com/postgres/postgres C:\projects\postgres
+  - git clone -b REL_10_STABLE https://github.com/postgres/postgres C:\projects\postgres
   - git -C C:\projects\postgres apply C:\projects\citus\windows\Mkvcbuild.pm.patch
   # temporary hack: mark enable_hashagg PGDLLIMPORT
-  - git -C C:\projects\postgres fetch origin 935dee9ad5a8d12f4d3b772a6e6c99d245e5ad44
   - git -C C:\projects\postgres cherry-pick 935dee9ad5a8d12f4d3b772a6e6c99d245e5ad44
   # only build Citus, don't build the other contrib modules
   - git -C C:\projects\postgres apply C:\projects\citus\windows\Mkvcbuild-minimize.patch
