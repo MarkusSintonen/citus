@@ -46,9 +46,6 @@ install:
   - set PATH=%PATH%;C:\msys64\usr\bin
   - flex --version
   - bison --version
-  # we need this for usage reporting
-  - vcpkg install curl:x64-windows
-  - vcpkg owns curl.h
   # make postgres think we're a contrib module
   - git clone --depth 1 -b REL_10_STABLE https://github.com/postgres/postgres C:\projects\postgres
   - git -C C:\projects\postgres apply C:\projects\citus\windows\Mkvcbuild.pm.patch
@@ -61,6 +58,9 @@ install:
   - mkdir C:\projects\postgres\contrib
   - xcopy /i /e C:\projects\citus C:\projects\postgres\contrib\citus
   - '"C:\Program Files (x86)\Microsoft Visual Studio\2017\Community\VC\Auxiliary\Build\vcvars64.bat"'
+  # we need this for usage reporting
+  - vcpkg install curl:x64-windows
+  - vcpkg owns curl.h
 
 #---------------------------------#
 #       build configuration       #
