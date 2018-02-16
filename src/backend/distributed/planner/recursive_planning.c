@@ -461,9 +461,19 @@ AnchorSubqueryRte(Query *subquery)
 	{
 		RangeTblEntry *rte = rt_fetch(currentRTEIndex, subquery->rtable);
 
-		/* make sure that our subquery contains at least one distributed table */
+		/*
+		 * Make sure that our subquery contains at least one distributed table
+		 * and doesn't have a set operation.
+		 *
+		 * The set operation restriction might sound weird, but, the restriction
+		 * equivalance generation functions ignore set operations. We should
+		 * integrate the logic in SafeToPushdownUnionSubquery() to
+		 * GenerateAllAttributeEquivalences() such that the latter becomes aware of
+		 * the set operations.
+		*/
 		if (rte->rtekind == RTE_SUBQUERY &&
-			QueryContainsDistributedTableRTE(rte->subquery))
+			QueryContainsDistributedTableRTE(rte->subquery) &&
+			rte->subquery->setOperations == NULL)
 		{
 			return rte;
 		}
@@ -623,6 +633,10 @@ SubqueryColocated(Query *subquery, NonColocatedSubqueryContext *context)
 	 * restrictions to form a temporary relation restriction context. The aim of
 	 * forming this temporary context is to check whether the context contains
 	 * distribution key equality or not.
+	 */
+
+	/*
+	 * TODO: Merge should exclude the same restrictions.
 	 */
 	mergedRestrictionContext = palloc0(sizeof(RelationRestrictionContext));
 	mergedRelationRestrictionList = list_copy(anchorRelationRestrictionList);
