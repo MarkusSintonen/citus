@@ -67,6 +67,7 @@
 #include "distributed/relation_restriction_equivalence.h"
 #include "lib/stringinfo.h"
 #include "optimizer/planner.h"
+#include "optimizer/prep.h"
 #include "parser/parsetree.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/nodes.h"
@@ -112,6 +113,17 @@ typedef struct VarLevelsUpWalkerContext
 } VarLevelsUpWalkerContext;
 
 
+/*
+ *
+ */
+typedef struct NonColocatedSubqueryContext
+{
+	Query *subquery;
+	List *subqueryAttributeEquivalances;
+	List *anchorRelationRestrictionList;
+	PlannerRestrictionContext *subqueryPlannerRestriction;
+} NonColocatedSubqueryContext;
+
 /* local function forward declarations */
 static DeferredErrorMessage * RecursivelyPlanSubqueriesAndCTEs(Query *query,
 															   RecursivePlanningContext *
@@ -122,6 +134,14 @@ static bool ShouldRecursivelyPlanNonColocatedSubqueries(Query *subquery,
 														context);
 static void RecursivelyPlanNonColocatedSubqueries(Query *subquery,
 												  RecursivePlanningContext *context);
+static RangeTblEntry * AnchorSubqueryRte(Query *subquery);
+static void RecursivelyPlanNonColocatedJoinWalker(Node *joinNode,
+												  NonColocatedSubqueryContext *
+												  nonColocatedPlanningContext,
+												  RecursivePlanningContext *
+												  recursivePlanningContext);
+static bool JoinNodeColocated(Node *joinNode, NonColocatedSubqueryContext *context);
+static bool SubqueryColocated(Query *subquery, NonColocatedSubqueryContext *context);
 static bool ShouldRecursivelyPlanAllSubqueriesInWhere(Query *query);
 static bool RecursivelyPlanAllSubqueries(Node *node,
 										 RecursivePlanningContext *planningContext);
@@ -278,6 +298,10 @@ RecursivelyPlanSubqueriesAndCTEs(Query *query, RecursivePlanningContext *context
 		RecursivelyPlanAllSubqueries((Node *) query->jointree->quals, context);
 	}
 
+	/*
+	 * If the query doesn't have distribution key equality,
+	 * recursively plan some of its subqueries.
+	 */
 	if (ShouldRecursivelyPlanNonColocatedSubqueries(query, context))
 	{
 		RecursivelyPlanNonColocatedSubqueries(query, context);
@@ -299,7 +323,10 @@ static bool
 ShouldRecursivelyPlanNonColocatedSubqueries(Query *subquery,
 											RecursivePlanningContext *context)
 {
-	/* if the input query already contains the equality, simply return */
+	/*
+	 * If the input query already contains the equality, simply return since it is not
+	 * possible to find any non colocated subqueries.
+	 */
 	if (context->queryContainsDistributionKeyEquality)
 	{
 		return false;
@@ -321,7 +348,7 @@ ShouldRecursivelyPlanNonColocatedSubqueries(Query *subquery,
 	/*
 	 * At this point, we might be recursively planning a a subquery which will be pulled
 	 * by PostgreSQL standard_planner (i.e., tpch_7_nested). However, checking for those
-	 * cases are pretty complicated and, seems not super useful thing to implement.
+	 * cases is pretty complicated and, seems not super useful thing to implement.
 	 */
 
 
@@ -344,9 +371,274 @@ ShouldRecursivelyPlanNonColocatedSubqueries(Query *subquery,
 }
 
 
+/*
+ * RecursivelyPlanNonColocatedSubqueries gets a query which includes one or more
+ * other subqueries that are not joined on their distribution keys. The function
+ * tries to recursively plan some of the subqueries to make the input query
+ * executable by Citus.
+ *
+ * The function picks an anchor subquery and iterates on the remaining subqueries.
+ * Whenever it finds a non colocated subquery with the anchor subquery, the function
+ * decides to recursively plan the non colocated subquery.
+ *
+ * The function first handles subqueries in FROM clause (i.e., jointree->fromlist) and then
+ * subqueries in WHERE clause (i.e., jointree->quals).
+ *
+ * The function does not treat outer joins seperately. Thus, we might end up with
+ * a query where the function decides to recursively plan an outer side of an outer
+ * join (i.e., LEFT side of LEFT JOIN). For simplicity, we chose to do so and handle
+ * outer joins with a seperate pass on the join tree.
+ */
 static void
-RecursivelyPlanNonColocatedSubqueries(Query *query, RecursivePlanningContext *context)
-{ }
+RecursivelyPlanNonColocatedSubqueries(Query *subquery, RecursivePlanningContext *context)
+{
+	NonColocatedSubqueryContext nonColocatedPlanningContext;
+
+	RangeTblEntry *anchorSubqueryRte = NULL;
+	Query *anchorSubquery = NULL;
+	PlannerRestrictionContext *anchorPlannerRestrictionContext = NULL;
+	RelationRestrictionContext *anchorRelationRestrictionContext = NULL;
+	List *anchorRestrictionEquivalences = NIL;
+
+	FromExpr *joinTree = subquery->jointree;
+	PlannerRestrictionContext *plannerRestrictionContext = NULL;
+
+	/* we couldn't pick an anchor subquery, so we cannot continue */
+	anchorSubqueryRte = AnchorSubqueryRte(subquery);
+	if (anchorSubqueryRte == NULL)
+	{
+		return;
+	}
+
+	plannerRestrictionContext = context->plannerRestrictionContext;
+
+	/* calculate the necessary information related to the anchor subquery */
+	anchorSubquery = anchorSubqueryRte->subquery;
+	anchorPlannerRestrictionContext =
+		FilterPlannerRestrictionForQuery(plannerRestrictionContext, anchorSubquery);
+	anchorRelationRestrictionContext =
+		anchorPlannerRestrictionContext->relationRestrictionContext;
+	anchorRestrictionEquivalences =
+		GenerateAllAttributeEquivalences(anchorPlannerRestrictionContext);
+
+	/* fill the non colocated planning context */
+	nonColocatedPlanningContext.subquery = subquery;
+	nonColocatedPlanningContext.subqueryPlannerRestriction = plannerRestrictionContext;
+
+	nonColocatedPlanningContext.anchorRelationRestrictionList =
+		anchorRelationRestrictionContext->relationRestrictionList;
+	nonColocatedPlanningContext.subqueryAttributeEquivalances =
+		anchorRestrictionEquivalences;
+
+	/* handle from clause subqueries first */
+	RecursivelyPlanNonColocatedJoinWalker((Node *) joinTree, &nonColocatedPlanningContext,
+										  context);
+}
+
+
+/*
+ * AnchorSubqueryRte gets a query and searches for a subquery within the join tree of
+ * the query such that we can use it as our anchor subquery during our planning.
+ *
+ * The function returns NULL if it cannot find a proper range table entry for our
+ * purposes.
+ */
+static RangeTblEntry *
+AnchorSubqueryRte(Query *subquery)
+{
+	FromExpr *joinTree = subquery->jointree;
+	Relids joinRelIds = get_relids_in_jointree((Node *) joinTree, false);
+	int currentRTEIndex = -1;
+
+	/*
+	 * Pick a random anchor subquery (i.e., the first) for now. We might consider
+	 * picking a better rte as the anchor. For example, we could iterate on the
+	 * joinRelIds, and check which rteIndex has more distribution key equiality
+	 * with rteIndexes. For the time being, the current primitive approach helps
+	 * us in many cases.
+	 */
+	while ((currentRTEIndex = bms_next_member(joinRelIds, currentRTEIndex)) >= 0)
+	{
+		RangeTblEntry *rte = rt_fetch(currentRTEIndex, subquery->rtable);
+
+		/* make sure that our subquery contains at least one distributed table */
+		if (rte->rtekind == RTE_SUBQUERY &&
+			QueryContainsDistributedTableRTE(rte->subquery))
+		{
+			return rte;
+		}
+	}
+
+	return NULL;
+}
+
+
+/*
+ * RecursivelyPlanNonColocatedJoinWalker gets a join node and walks over it to find
+ * subqueries that live under the node.
+ *
+ * When a subquery found, its checked whether the subquery is colocated with the
+ * anchor subquery specified in the nonColocatedPlanningContext. If not,
+ * the subquery is recursively planned.
+ */
+static void
+RecursivelyPlanNonColocatedJoinWalker(Node *joinNode,
+									  NonColocatedSubqueryContext *
+									  nonColocatedPlanningContext,
+									  RecursivePlanningContext *recursivePlanningContext)
+{
+	if (joinNode == NULL)
+	{
+		return;
+	}
+	else if (IsA(joinNode, FromExpr))
+	{
+		FromExpr *fromExpr = (FromExpr *) joinNode;
+		ListCell *fromExprCell;
+
+		/*
+		 * For each element of the from list, check whether the element is
+		 * colocated with the anchor subquery. If not, walk until we
+		 * find the subqueries.
+		 */
+		foreach(fromExprCell, fromExpr->fromlist)
+		{
+			Node *fromElement = (Node *) lfirst(fromExprCell);
+
+			if (!JoinNodeColocated(fromElement, nonColocatedPlanningContext))
+			{
+				RecursivelyPlanNonColocatedJoinWalker(fromElement,
+													  nonColocatedPlanningContext,
+													  recursivePlanningContext);
+			}
+		}
+	}
+	else if (IsA(joinNode, JoinExpr))
+	{
+		JoinExpr *joinExpr = (JoinExpr *) joinNode;
+
+		/* recurse into the left subtree if needed */
+		if (!JoinNodeColocated(joinExpr->larg, nonColocatedPlanningContext))
+		{
+			RecursivelyPlanNonColocatedJoinWalker(joinExpr->larg,
+												  nonColocatedPlanningContext,
+												  recursivePlanningContext);
+		}
+
+		/* recurse into the right subtree if needed */
+		if (!JoinNodeColocated(joinExpr->rarg, nonColocatedPlanningContext))
+		{
+			RecursivelyPlanNonColocatedJoinWalker(joinExpr->rarg,
+												  nonColocatedPlanningContext,
+												  recursivePlanningContext);
+		}
+	}
+	else if (IsA(joinNode, RangeTblRef))
+	{
+		int rangeTableIndex = ((RangeTblRef *) joinNode)->rtindex;
+		List *rangeTableList = nonColocatedPlanningContext->subquery->rtable;
+		RangeTblEntry *rte = rt_fetch(rangeTableIndex, rangeTableList);
+		Query *subquery = NULL;
+
+		/* we're only interested in subqueries for now */
+		if (rte->rtekind != RTE_SUBQUERY)
+		{
+			return;
+		}
+
+		/*
+		 * If the subquery is not colocated with the anchor subquery,
+		 * recursively plan it.
+		 */
+		subquery = rte->subquery;
+		if (!SubqueryColocated(subquery, nonColocatedPlanningContext))
+		{
+			RecursivelyPlanSubquery(subquery, recursivePlanningContext);
+		}
+	}
+	else
+	{
+		pg_unreachable();
+	}
+}
+
+
+/*
+ * JoinNodeColocated returns true if all the subqueries under the given join node
+ * has a distribution key equality with the anchor subquery. In other words,
+ * we refer the distribution key equality of relations as "colocation" in this
+ * context.
+ *
+ * Note that we currently skip relations rtes. If the join node contains a
+ * relation rte that is not colocated with the anchor subquery, we'd fail
+ * to execute the query in the end.
+ */
+static bool
+JoinNodeColocated(Node *joinNode, NonColocatedSubqueryContext *context)
+{
+	int currentRTEIndex = -1;
+	Relids rteIndexes = get_relids_in_jointree(joinNode, false);
+
+	while ((currentRTEIndex = bms_next_member(rteIndexes, currentRTEIndex)) >= 0)
+	{
+		RangeTblEntry *rte = rt_fetch(currentRTEIndex, context->subquery->rtable);
+
+		if (rte->rtekind == RTE_SUBQUERY)
+		{
+			Query *subquery = rte->subquery;
+
+			if (!SubqueryColocated(subquery, context))
+			{
+				return false;
+			}
+		}
+	}
+
+	return true;
+}
+
+
+/*
+ *
+ * SubqueryColocated returns true if the input subquery has a distribution
+ * key equality with the anchor subquery. In other words, we refer the
+ * distribution key equality of relations as "colocation" in this context.
+ */
+static bool
+SubqueryColocated(Query *subquery, NonColocatedSubqueryContext *context)
+{
+	List *anchorRelationRestrictionList = context->anchorRelationRestrictionList;
+	PlannerRestrictionContext *restrictionContext = context->subqueryPlannerRestriction;
+	List *attributeEquivalances = context->subqueryAttributeEquivalances;
+
+	PlannerRestrictionContext *filteredPlannerContext =
+		FilterPlannerRestrictionForQuery(restrictionContext, subquery);
+	List *filteredRestrictionList =
+		filteredPlannerContext->relationRestrictionContext->relationRestrictionList;
+	RelationRestrictionContext *mergedRestrictionContext = NULL;
+	List *mergedRelationRestrictionList = NULL;
+
+	/*
+	 * We merge the relation restrictions of the input subquery and the anchor
+	 * restrictions to form a temporary relation restriction context. The aim of
+	 * forming this temporary context is to check whether the context contains
+	 * distribution key equality or not.
+	 */
+	mergedRestrictionContext = palloc0(sizeof(RelationRestrictionContext));
+	mergedRelationRestrictionList = list_copy(anchorRelationRestrictionList);
+	mergedRelationRestrictionList =
+		list_concat(mergedRelationRestrictionList, filteredRestrictionList);
+
+	mergedRestrictionContext->relationRestrictionList = mergedRelationRestrictionList;
+
+	if (!EquivalenceListContainsRelationsEquality(attributeEquivalances,
+												  mergedRestrictionContext))
+	{
+		return false;
+	}
+
+	return true;
+}
 
 
 /*

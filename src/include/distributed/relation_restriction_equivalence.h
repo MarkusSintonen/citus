@@ -34,4 +34,8 @@ extern PlannerRestrictionContext * FilterPlannerRestrictionForQuery(
 extern JoinRestrictionContext * RemoveDuplicateJoinRestrictions(JoinRestrictionContext *
 																joinRestrictionContext);
 
+extern bool EquivalenceListContainsRelationsEquality(List *attributeEquivalenceList,
+													 RelationRestrictionContext *
+													 restrictionContext);
+
 #endif /* RELATION_RESTRICTION_EQUIVALENCE_H */
