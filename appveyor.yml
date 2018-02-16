@@ -19,10 +19,7 @@ max_jobs: 1
 #---------------------------------#
 
 cache:
-  - C:\tools\vcpkg\
-  - C:\Tools\vcpkg\
-  - C:\tools\vcpkg
-  - C:\Tools\vcpkg
+  - C:\tools\vcpkg\installed\
 
 # Build worker image (VM template)
 image: Visual Studio 2017
