@@ -125,6 +125,12 @@ typedef struct PruningInstance
 	bool isPartial;
 } PruningInstance;
 
+typedef struct PruneNode
+{
+	BoolExprType boolOp;
+	List *bools;
+	List *conditions;
+} PruneNode;
 
 /*
  * Partial instances that need to be finished building.  This is used to
@@ -134,6 +140,7 @@ typedef struct PendingPruningInstance
 {
 	PruningInstance *instance;
 	Node *continueAt;
+	PruneNode *continueAtPruneNode;
 } PendingPruningInstance;
 
 
@@ -166,8 +173,12 @@ typedef struct ClauseWalkerContext
 	FunctionCallInfoData compareIntervalFunctionCall;
 } ClauseWalkerContext;
 
+static void SimplifyANDTree(PruneNode *andNode, PruneNode *parent);
 static void PrunableExpressions(Node *originalNode, ClauseWalkerContext *context);
-static bool PrunableExpressionsWalker(Node *originalNode, ClauseWalkerContext *context);
+static bool PrunableExpressionsWalker(Node *node, ClauseWalkerContext *context);
+static void PrunableExpressionsWalker2(PruneNode *node, ClauseWalkerContext *context);
+static void PrunableExpressions2(PruneNode *node, ClauseWalkerContext *context);
+static void HandleConditionNode(Node *node, ClauseWalkerContext *context);
 static void AddPartitionKeyRestrictionToInstance(ClauseWalkerContext *context,
 												 OpExpr *opClause, Var *varClause,
 												 Const *constantClause);
@@ -177,6 +188,7 @@ static void AddSAOPartitionKeyRestrictionToInstance(ClauseWalkerContext *context
 static void AddHashRestrictionToInstance(ClauseWalkerContext *context, OpExpr *opClause,
 										 Var *varClause, Const *constantClause);
 static void AddNewConjuction(ClauseWalkerContext *context, OpExpr *op);
+static void AddNewConjuction2(ClauseWalkerContext *context, PruneNode *pruneNode);
 static PruningInstance * CopyPartialPruningInstance(PruningInstance *sourceInstance);
 static List * ShardArrayToList(ShardInterval **shardArray, int length);
 static List * DeepCopyShardIntervalList(List *originalShardIntervalList);
@@ -203,6 +215,10 @@ static int LowerShardBoundary(Datum partitionColumnValue,
 							  ShardInterval **shardIntervalCache,
 							  int shardCount, FunctionCallInfoData *compareFunction,
 							  bool includeMax);
+
+static bool BuildPruneTree(Node *node, PruneNode *pruneNode);
+static PruneNode* BooleanDistributeANDedORs(PruneNode *pruneNode);
+static void BooleanPrint(PruneNode *pruneNode);
 
 
 /*
@@ -280,8 +296,25 @@ PruneShards(Oid relationId, Index rangeTableId, List *whereClauseList,
 							   "a partition column comparator")));
 	}
 
+	/* Build prune tree */
+	PruneNode pruneNode = { 0 };
+	pruneNode.boolOp = AND_EXPR;
+	ereport(DEBUG2, (errmsg("================")));
+	BuildPruneTree((Node *) whereClauseList, &pruneNode);
+	BooleanPrint(&pruneNode);
+	ereport(DEBUG2, (errmsg("--AFTER SIMPLIFY--")));
+	SimplifyANDTree(&pruneNode, (PruneNode*)NULL);
+	BooleanPrint(&pruneNode);
+	ereport(DEBUG2, (errmsg("--AFTER DISTRIBUTION--")));
+	PruneNode* pruneNode3 = BooleanDistributeANDedORs(&pruneNode);
+	BooleanPrint(pruneNode3);
+	ereport(DEBUG2, (errmsg("================")));
+
 	/* Figure out what we can prune on */
-	PrunableExpressions((Node *) whereClauseList, &context);
+	//PrunableExpressions((Node *) whereClauseList, &context);
+
+	/* Figure out what we can prune on */
+	PrunableExpressions2(pruneNode3, &context);
 
 	/*
 	 * Prune using each of the PrunableInstances we found, and OR results
@@ -340,6 +373,13 @@ PruneShards(Oid relationId, Index rangeTableId, List *whereClauseList,
 			}
 		}
 
+		if (prune->equalConsts)
+		{
+			char *str1 = palloc0(100);
+			sprintf(str1, "equalConsts= %d", DatumGetInt32(prune->equalConsts->constvalue));
+			ereport(DEBUG2, (errmsg(str1)));
+		}
+
 		pruneOneList = PruneOne(cacheEntry, &context, prune);
 
 		if (prunedList)
@@ -363,8 +403,13 @@ PruneShards(Oid relationId, Index rangeTableId, List *whereClauseList,
 	/* found no valid restriction, build list of all shards */
 	if (!foundRestriction)
 	{
+		ereport(DEBUG2, (errmsg("foundRestriction= FALSE")));
 		prunedList = ShardArrayToList(cacheEntry->sortedShardIntervalArray,
 									  cacheEntry->shardIntervalArrayLength);
+	}
+	else
+	{
+		ereport(DEBUG2, (errmsg("foundRestriction= TRUE")));
 	}
 
 	/* if requested, copy the partition value constant */
@@ -416,6 +461,53 @@ ContainsFalseClause(List *whereClauseList)
 	return containsFalseClause;
 }
 
+static void
+PrunableExpressions2(PruneNode *node, ClauseWalkerContext *context)
+{
+	/*
+	 * Build initial list of prunable expressions.  As long as only,
+	 * implicitly or explicitly, ANDed expressions are found, this perform a
+	 * depth-first search.  When an ORed expression is found, the current
+	 * PruningInstance is added to context->pruningInstances (once for each
+	 * ORed expression), then the tree-traversal is continued without
+	 * recursing.  Once at the top-level again, we'll process all pending
+	 * expressions - that allows us to find all ANDed expressions, before
+	 * recursing into an ORed expression.
+	 */
+	PrunableExpressionsWalker2(node, context);
+
+	/*
+	 * Process all pending instances.  While processing, new ones might be
+	 * added to the list, so don't use foreach().
+	 *
+	 * Check the places in PruningInstanceWalker that push onto
+	 * context->pendingInstances why construction of the PruningInstance might
+	 * be pending.
+	 *
+	 * We copy the partial PruningInstance, and continue adding information by
+	 * calling PrunableExpressionsWalker() on the copy, continuing at the the
+	 * node stored in PendingPruningInstance->continueAt.
+	 */
+	while (context->pendingInstances != NIL)
+	{
+		PendingPruningInstance *instance =
+			(PendingPruningInstance *) linitial(context->pendingInstances);
+		PruningInstance *newPrune = CopyPartialPruningInstance(instance->instance);
+
+		context->pendingInstances = list_delete_first(context->pendingInstances);
+
+		context->currentPruningInstance = newPrune;
+		if (instance->continueAtPruneNode)
+		{
+			PrunableExpressionsWalker2(instance->continueAtPruneNode, context);
+		}
+		if (instance->continueAt)
+		{
+			PrunableExpressionsWalker(instance->continueAt, context);
+		}
+		context->currentPruningInstance = NULL;
+	}
+}
 
 /*
  * PrunableExpressions builds a list of all prunable expressions in node,
@@ -462,6 +554,350 @@ PrunableExpressions(Node *node, ClauseWalkerContext *context)
 	}
 }
 
+static bool BuildPruneTree(Node *node, PruneNode *pruneNode)
+{
+	if (node == NULL)
+	{
+		return false;
+	}
+
+	/*
+	 * Check for boolean expressions and their args.
+	 */
+	if (IsA(node, List))
+	{
+		/* at the top of quals we'll frequently see lists, those are to be treated as ANDs */
+	}
+	else if (IsA(node, BoolExpr))
+	{
+		BoolExpr *boolExpr = (BoolExpr *) node;
+
+		if (boolExpr->boolop == NOT_EXPR)
+		{
+			return false;
+		}
+		else if (boolExpr->boolop != pruneNode->boolOp)
+		{
+			PruneNode *newNode = palloc0(sizeof(PruneNode));
+			newNode->boolOp = boolExpr->boolop;
+
+			pruneNode->bools = lappend(pruneNode->bools, newNode);
+
+			return expression_tree_walker((Node *) boolExpr->args,
+					BuildPruneTree, newNode);
+		}
+	}
+	else if (IsA(node, OpExpr) || IsA(node, ScalarArrayOpExpr))
+	{
+		pruneNode->conditions = lappend(pruneNode->conditions, node);
+
+		return false;
+	}
+	else
+	{
+		return false;
+	}
+
+	return expression_tree_walker(node, BuildPruneTree, pruneNode);
+}
+
+static void SimplifyORTree(PruneNode *orNode, PruneNode *andParent)
+{
+	ListCell *cell = NULL;
+
+	if (andParent->bools && andParent->bools->length == 1 && !andParent->conditions)
+	{
+		andParent->boolOp = orNode->boolOp;
+		andParent->bools = orNode->bools;
+		andParent->conditions = orNode->conditions;
+	}
+
+	if (orNode->conditions && orNode->conditions->length > 0)
+	{
+		PruneNode *newAnd = palloc0(sizeof(PruneNode));
+		newAnd->boolOp = AND_EXPR;
+		newAnd->conditions = orNode->conditions;
+		//orNode->conditions = (List*)NULL;
+	}
+
+	if (orNode->bools && orNode->bools->length > 0)
+	{
+		foreach(cell, orNode->bools)
+		{
+			SimplifyANDTree((PruneNode *)lfirst(cell), orNode);
+		}
+	}
+}
+
+static void SimplifyANDTree(PruneNode *andNode, PruneNode *orParent)
+{
+	ListCell *cell = NULL;
+
+	if (orParent && orParent->bools && orParent->bools->length == 1 && orParent->conditions && orParent->conditions->length == 0)
+	{
+		orParent->boolOp = andNode->boolOp;
+		orParent->bools = andNode->bools;
+		orParent->conditions = andNode->conditions;
+	}
+
+	if (andNode->bools && andNode->bools->length > 0)
+	{
+		foreach(cell, andNode->bools)
+		{
+			SimplifyORTree((PruneNode *)lfirst(cell), andNode);
+		}
+	}
+}
+
+static void MakeAnds(PruneNode *newOr, ListCell *boolsCell)
+{
+	PruneNode *boolNode = lfirst(boolsCell);
+	if (boolNode->boolOp != OR_EXPR)
+	{
+		return;
+	}
+
+	ListCell *next = lnext(boolsCell);
+	if (!next)
+	{
+		return;
+	}
+
+	PruneNode *boolNode2 = lfirst(next);
+	if (boolNode2->boolOp != OR_EXPR)
+	{
+		return;
+	}
+
+	ListCell *cell = NULL;
+	ListCell *cell2 = NULL;
+
+	foreach(cell, boolNode->conditions)
+	{
+		Node *cond = lfirst(cell);
+
+		foreach(cell2, boolNode2->conditions)
+		{
+			Node *cond2 = lfirst(cell2);
+
+			PruneNode *newAnd = palloc0(sizeof(PruneNode));
+			newAnd->boolOp = AND_EXPR;
+
+			newAnd->conditions = lappend(newAnd->conditions, cond);
+			newAnd->conditions = lappend(newAnd->conditions, cond2);
+
+			newOr->bools = lappend(newOr->bools, newAnd);
+		}
+	}
+}
+
+static PruneNode* BooleanDistributeANDedORs(PruneNode *node)
+{
+	ListCell *cell = NULL;
+
+	PruneNode *andNode = node->boolOp == AND_EXPR ? node : NULL;
+	PruneNode *orNode = node->boolOp == OR_EXPR ? node : NULL;
+
+	if (orNode)
+	{
+		if (orNode->bools)
+		{
+			PruneNode *newOr = palloc0(sizeof(PruneNode));
+			newOr->boolOp = OR_EXPR;
+
+			foreach(cell, orNode->bools)
+			{
+				andNode = lfirst(cell);
+
+				newOr->bools = lappend(newOr->bools, BooleanDistributeANDedORs(andNode));
+			}
+
+			return newOr;
+		}
+		else
+		{
+			return orNode;
+		}
+	}
+
+	if (!andNode->bools || andNode->bools->length == 0)
+	{
+		return andNode;
+	}
+
+	if (andNode->bools->length == 1)
+	{
+		PruneNode *orNode = linitial(andNode->bools);
+
+		return orNode;
+	}
+
+	PruneNode *newOr = palloc0(sizeof(PruneNode));
+	newOr->boolOp = OR_EXPR;
+
+	/* Iterate OR nodes under the AND node distributing them */
+
+	foreach(cell, andNode->bools)
+	{
+		MakeAnds(newOr, cell);
+	}
+
+	return newOr;
+}
+
+static void BooleanPrint2(PruneNode *node, int depth)
+{
+	if (!node)
+	{
+		return;
+	}
+
+	char *str = palloc0(100);
+
+	if (node->boolOp == AND_EXPR)
+	{
+		sprintf(str, "%*s AND conds=%d bools=%d", depth, "", node->conditions ? node->conditions->length : 0, node->bools ? node->bools->length : 0);
+		ereport(DEBUG2, (errmsg(str)));
+	}
+	else if (node->boolOp == OR_EXPR)
+	{
+		sprintf(str, "%*s OR conds=%d bools=%d", depth, "", node->conditions ? node->conditions->length : 0, node->bools ? node->bools->length : 0);
+		ereport(DEBUG2, (errmsg(str)));
+	}
+
+	ListCell *cell = NULL;
+	foreach(cell, node->bools)
+	{
+		PruneNode *boolNode = lfirst(cell);
+		BooleanPrint2(boolNode, depth + 1);
+	}
+}
+
+static void BooleanPrint(PruneNode *pruneNode)
+{
+	BooleanPrint2(pruneNode, 0);
+}
+
+static void
+PrunableExpressionsWalker2(PruneNode *node, ClauseWalkerContext *context)
+{
+	if (node == NULL)
+	{
+		return;
+	}
+
+	char *str1 = palloc0(100);
+	char *str2 = palloc0(100);
+
+	ListCell *cell = NULL;
+
+	if (node->boolOp == AND_EXPR)
+	{
+		foreach(cell, node->bools)
+		{
+			PruneNode *boolNode = lfirst(cell);
+			PrunableExpressionsWalker2(boolNode, context);
+		}
+		foreach(cell, node->conditions)
+		{
+			Node *cond = lfirst(cell);
+			HandleConditionNode(cond, context);
+		}
+	}
+	else
+	{
+		foreach(cell, node->bools)
+		{
+			PruneNode *boolNode = lfirst(cell);
+			AddNewConjuction2(context, boolNode);
+		}
+		foreach(cell, node->conditions)
+		{
+			Node *cond = lfirst(cell);
+			AddNewConjuction(context, (OpExpr*)cond);
+		}
+	}
+}
+
+static void
+HandleConditionNode(Node *node, ClauseWalkerContext *context)
+{
+	if (IsA(node, OpExpr))
+	{
+		OpExpr *opClause = (OpExpr *) node;
+		PruningInstance *prune = context->currentPruningInstance;
+		Node *leftOperand = NULL;
+		Node *rightOperand = NULL;
+		Const *constantClause = NULL;
+		Var *varClause = NULL;
+
+		if (!prune->addedToPruningInstances)
+		{
+			context->pruningInstances = lappend(context->pruningInstances,
+												prune);
+			prune->addedToPruningInstances = true;
+		}
+
+		if (list_length(opClause->args) == 2)
+		{
+			leftOperand = get_leftop((Expr *) opClause);
+			rightOperand = get_rightop((Expr *) opClause);
+
+			leftOperand = strip_implicit_coercions(leftOperand);
+			rightOperand = strip_implicit_coercions(rightOperand);
+
+			if (IsA(rightOperand, Const) && IsA(leftOperand, Var))
+			{
+				constantClause = (Const *) rightOperand;
+				varClause = (Var *) leftOperand;
+			}
+			else if (IsA(leftOperand, Const) && IsA(rightOperand, Var))
+			{
+				constantClause = (Const *) leftOperand;
+				varClause = (Var *) rightOperand;
+			}
+		}
+
+		if (constantClause && varClause && equal(varClause, context->partitionColumn))
+		{
+			/*
+			 * Found a restriction on the partition column itself. Update the
+			 * current constraint with the new information.
+			 */
+			AddPartitionKeyRestrictionToInstance(context,
+												 opClause, varClause, constantClause);
+		}
+		else if (constantClause && varClause &&
+				 varClause->varattno == RESERVED_HASHED_COLUMN_ID)
+		{
+			/*
+			 * Found restriction that directly specifies the boundaries of a
+			 * hashed column.
+			 */
+			AddHashRestrictionToInstance(context, opClause, varClause, constantClause);
+		}
+	}
+	else if (IsA(node, ScalarArrayOpExpr))
+	{
+		ScalarArrayOpExpr *arrayOperatorExpression = (ScalarArrayOpExpr *) node;
+		AddSAOPartitionKeyRestrictionToInstance(context, arrayOperatorExpression);
+	}
+	else
+	{
+		PruningInstance *prune = context->currentPruningInstance;
+
+		/*
+		 * Mark expression as added, so we'll fail pruning if there's no ANDed
+		 * restrictions that we know how to deal with.
+		 */
+		if (!prune->addedToPruningInstances)
+		{
+			context->pruningInstances = lappend(context->pruningInstances,
+												prune);
+			prune->addedToPruningInstances = true;
+		}
+	}
+}
 
 /*
  * PrunableExpressionsWalker() is the main work horse for
@@ -698,6 +1134,23 @@ AddNewConjuction(ClauseWalkerContext *context, OpExpr *op)
 
 	instance->instance = context->currentPruningInstance;
 	instance->continueAt = (Node *) op;
+
+	/*
+	 * Signal that this instance is not to be used for pruning on
+	 * its own.  Once the pending instance is processed, it'll be
+	 * used.
+	 */
+	instance->instance->isPartial = true;
+	context->pendingInstances = lappend(context->pendingInstances, instance);
+}
+
+static void
+AddNewConjuction2(ClauseWalkerContext *context, PruneNode *pruneNode)
+{
+	PendingPruningInstance *instance = palloc0(sizeof(PendingPruningInstance));
+
+	instance->instance = context->currentPruningInstance;
+	instance->continueAtPruneNode = pruneNode;
 
 	/*
 	 * Signal that this instance is not to be used for pruning on

@@ -144,3 +144,30 @@ SELECT count(*)
 	WHERE orders1.o_orderkey = orders2.o_orderkey
 	AND orders1.o_orderkey = 1
 	AND orders2.o_orderkey is NULL;
+
+
+EXPLAIN SELECT count(*) FROM orders_hash_partitioned;
+
+
+EXPLAIN SELECT count(*) FROM orders_hash_partitioned
+	WHERE o_orderkey = 1;
+
+
+EXPLAIN SELECT count(*) FROM orders_hash_partitioned
+	WHERE (o_orderkey = 1 OR o_orderkey = 2);
+
+
+EXPLAIN SELECT count(*) FROM orders_hash_partitioned
+	WHERE (o_orderkey = 1 OR o_orderkey = 2) AND (o_custkey = 3 OR o_custkey = 4);
+	
+	
+EXPLAIN SELECT count(*) FROM orders_hash_partitioned
+	WHERE (o_orderkey = 1 AND o_custkey = 3) OR (o_orderkey = 1 AND o_custkey = 4) OR (o_orderkey = 2 AND o_custkey = 3) OR (o_orderkey = 2 AND o_custkey = 4);
+	
+	
+EXPLAIN SELECT count(*) FROM orders_hash_partitioned
+	WHERE (o_orderkey IN (1,2)) AND (o_custkey = 3 OR o_custkey = 4);
+	
+	
+EXPLAIN SELECT count(*) FROM orders_hash_partitioned
+	WHERE (o_orderkey IN (1,2) AND o_custkey = 3) OR (o_orderkey IN (1,2) OR o_custkey = 4);
