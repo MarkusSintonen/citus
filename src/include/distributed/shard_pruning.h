@@ -16,6 +16,9 @@
 
 #define INVALID_SHARD_INDEX -1
 
+/* Config variables managed via guc.c */
+extern bool LogShardPruning;
+
 /* Function declarations for shard pruning */
 extern List * PruneShards(Oid relationId, Index rangeTableId, List *whereClauseList,
 						  Const **partitionValueConst);

@@ -93,6 +93,7 @@ typedef struct PruningInstance
 	Const *equalConsts;
 	Const *greaterEqualConsts;
 	Const *greaterConsts;
+	List *saoEqualConsts;
 
 	/*
 	 * Constraint using a pre-hashed column value. The constant will store the
@@ -173,7 +174,10 @@ typedef struct ClauseWalkerContext
 	FunctionCallInfoData compareIntervalFunctionCall;
 } ClauseWalkerContext;
 
-static void SimplifyANDTree(PruneNode *andNode, PruneNode *parent);
+bool LogShardPruning = false; /* print shard pruning information as a debugging aid */
+
+static void SeparateBoolFromConditions(PruneNode *node);
+static void PullUpBooleanOps(PruneNode *node, PruneNode *parent);
 static void PrunableExpressions(Node *originalNode, ClauseWalkerContext *context);
 static bool PrunableExpressionsWalker(Node *node, ClauseWalkerContext *context);
 static void PrunableExpressionsWalker2(PruneNode *node, ClauseWalkerContext *context);
@@ -185,6 +189,8 @@ static void AddPartitionKeyRestrictionToInstance(ClauseWalkerContext *context,
 static void AddSAOPartitionKeyRestrictionToInstance(ClauseWalkerContext *context,
 													ScalarArrayOpExpr *
 													arrayOperatorExpression);
+static void AddSAOPartitionKeyRestrictionToInstance2(ClauseWalkerContext *context,
+													ScalarArrayOpExpr *arrayOperatorExpression);
 static void AddHashRestrictionToInstance(ClauseWalkerContext *context, OpExpr *opClause,
 										 Var *varClause, Const *constantClause);
 static void AddNewConjuction(ClauseWalkerContext *context, OpExpr *op);
@@ -217,9 +223,10 @@ static int LowerShardBoundary(Datum partitionColumnValue,
 							  bool includeMax);
 
 static bool BuildPruneTree(Node *node, PruneNode *pruneNode);
-static PruneNode* BooleanDistributeANDedORs(PruneNode *pruneNode);
+static PruneNode* BooleanDistributeToORofANDs(PruneNode *pruneNode);
 static void BooleanPrint(PruneNode *pruneNode);
 
+#define DebugLog(errmsg) if (LogShardPruning) { ereport(DEBUG2, (errmsg)); }
 
 /*
  * PruneShards returns all shards from a distributed table that cannot be
@@ -299,16 +306,19 @@ PruneShards(Oid relationId, Index rangeTableId, List *whereClauseList,
 	/* Build prune tree */
 	PruneNode pruneNode = { 0 };
 	pruneNode.boolOp = AND_EXPR;
-	ereport(DEBUG2, (errmsg("================")));
+	DebugLog(errmsg("================"));
 	BuildPruneTree((Node *) whereClauseList, &pruneNode);
 	BooleanPrint(&pruneNode);
-	ereport(DEBUG2, (errmsg("--AFTER SIMPLIFY--")));
-	SimplifyANDTree(&pruneNode, (PruneNode*)NULL);
+	DebugLog(errmsg("--AFTER PULL UP--"));
+	PullUpBooleanOps(&pruneNode, (PruneNode*)NULL);
 	BooleanPrint(&pruneNode);
-	ereport(DEBUG2, (errmsg("--AFTER DISTRIBUTION--")));
-	PruneNode* pruneNode3 = BooleanDistributeANDedORs(&pruneNode);
+	DebugLog(errmsg("--AFTER SEPARATE--"));
+	SeparateBoolFromConditions(&pruneNode);
+	BooleanPrint(&pruneNode);
+	DebugLog(errmsg("--AFTER DISTRIBUTION--"));
+	PruneNode* pruneNode3 = BooleanDistributeToORofANDs(&pruneNode);
 	BooleanPrint(pruneNode3);
-	ereport(DEBUG2, (errmsg("================")));
+	DebugLog(errmsg("================"));
 
 	/* Figure out what we can prune on */
 	//PrunableExpressions((Node *) whereClauseList, &context);
@@ -346,7 +356,7 @@ PruneShards(Oid relationId, Index rangeTableId, List *whereClauseList,
 
 		if (context.partitionMethod == DISTRIBUTE_BY_HASH)
 		{
-			if (!prune->evaluatesToFalse && !prune->equalConsts &&
+			if (!prune->evaluatesToFalse && !prune->equalConsts && !prune->saoEqualConsts &&
 				!prune->hashedEqualConsts)
 			{
 				/* if hash-partitioned and no equals constraints, return all shards */
@@ -371,13 +381,31 @@ PruneShards(Oid relationId, Index rangeTableId, List *whereClauseList,
 					singlePartitionValueConst = NULL;
 				}
 			}
-		}
+			else if (partitionValueConst != NULL && prune->saoEqualConsts != NULL)
+			{
+				ListCell *constCell = NULL;
 
-		if (prune->equalConsts)
-		{
-			char *str1 = palloc0(100);
-			sprintf(str1, "equalConsts= %d", DatumGetInt32(prune->equalConsts->constvalue));
-			ereport(DEBUG2, (errmsg(str1)));
+				foreach(constCell, prune->saoEqualConsts)
+				{
+					Const *saoConst = (Const*)lfirst(constCell);
+
+					if (!foundPartitionColumnValue)
+					{
+						/* remember the partition column value */
+						singlePartitionValueConst = saoConst;
+						foundPartitionColumnValue = true;
+					}
+					else if (singlePartitionValueConst == NULL)
+					{
+						/* already found multiple partition column values */
+					}
+					else if (!equal(saoConst, singlePartitionValueConst))
+					{
+						/* found multiple partition column values */
+						singlePartitionValueConst = NULL;
+					}
+				}
+			}
 		}
 
 		pruneOneList = PruneOne(cacheEntry, &context, prune);
@@ -403,13 +431,8 @@ PruneShards(Oid relationId, Index rangeTableId, List *whereClauseList,
 	/* found no valid restriction, build list of all shards */
 	if (!foundRestriction)
 	{
-		ereport(DEBUG2, (errmsg("foundRestriction= FALSE")));
 		prunedList = ShardArrayToList(cacheEntry->sortedShardIntervalArray,
 									  cacheEntry->shardIntervalArrayLength);
-	}
-	else
-	{
-		ereport(DEBUG2, (errmsg("foundRestriction= TRUE")));
 	}
 
 	/* if requested, copy the partition value constant */
@@ -601,55 +624,67 @@ static bool BuildPruneTree(Node *node, PruneNode *pruneNode)
 	return expression_tree_walker(node, BuildPruneTree, pruneNode);
 }
 
-static void SimplifyORTree(PruneNode *orNode, PruneNode *andParent)
+static bool IsPullUpBooleanOp(PruneNode *node)
+{
+	if (!node)
+	{
+		return false;
+	}
+
+	int countBools = node->bools ? node->bools->length : 0;
+	int countConditions = node->conditions ? node->conditions->length : 0;
+
+	return (countBools + countConditions) < 2;
+}
+
+static void PullUpBooleanOps(PruneNode *node, PruneNode *parent)
 {
 	ListCell *cell = NULL;
 
-	if (andParent->bools && andParent->bools->length == 1 && !andParent->conditions)
+	if (node->bools && node->bools->length > 0)
 	{
-		andParent->boolOp = orNode->boolOp;
-		andParent->bools = orNode->bools;
-		andParent->conditions = orNode->conditions;
-	}
-
-	if (orNode->conditions && orNode->conditions->length > 0)
-	{
-		PruneNode *newAnd = palloc0(sizeof(PruneNode));
-		newAnd->boolOp = AND_EXPR;
-		newAnd->conditions = orNode->conditions;
-		//orNode->conditions = (List*)NULL;
-	}
-
-	if (orNode->bools && orNode->bools->length > 0)
-	{
-		foreach(cell, orNode->bools)
+		foreach(cell, node->bools)
 		{
-			SimplifyANDTree((PruneNode *)lfirst(cell), orNode);
+			PullUpBooleanOps((PruneNode *)lfirst(cell), node);
 		}
+	}
+
+	if (IsPullUpBooleanOp(parent))
+	{
+		parent->boolOp = node->boolOp;
+		parent->bools = node->bools;
+		parent->conditions = node->conditions;
 	}
 }
 
-static void SimplifyANDTree(PruneNode *andNode, PruneNode *orParent)
+static void SeparateBoolFromConditions(PruneNode *node)
 {
 	ListCell *cell = NULL;
 
-	if (orParent && orParent->bools && orParent->bools->length == 1 && orParent->conditions && orParent->conditions->length == 0)
+	if (node->bools && node->bools->length > 0)
 	{
-		orParent->boolOp = andNode->boolOp;
-		orParent->bools = andNode->bools;
-		orParent->conditions = andNode->conditions;
+		foreach(cell, node->bools)
+		{
+			SeparateBoolFromConditions((PruneNode *)lfirst(cell));
+		}
 	}
 
-	if (andNode->bools && andNode->bools->length > 0)
+	if (node->conditions && node->bools)
 	{
-		foreach(cell, andNode->bools)
+		foreach(cell, node->conditions)
 		{
-			SimplifyORTree((PruneNode *)lfirst(cell), andNode);
+			PruneNode *newNode = palloc0(sizeof(PruneNode));
+			newNode->boolOp = node->boolOp == AND_EXPR ? OR_EXPR : AND_EXPR;
+			newNode->conditions = lappend(newNode->conditions, lfirst(cell));
+
+			node->bools = lappend(node->bools, newNode);
 		}
+
+		node->conditions = NULL;
 	}
 }
 
-static void MakeAnds(PruneNode *newOr, ListCell *boolsCell)
+static void MakeORofAnds(PruneNode *newOr, ListCell *boolsCell)
 {
 	PruneNode *boolNode = lfirst(boolsCell);
 	if (boolNode->boolOp != OR_EXPR)
@@ -691,7 +726,7 @@ static void MakeAnds(PruneNode *newOr, ListCell *boolsCell)
 	}
 }
 
-static PruneNode* BooleanDistributeANDedORs(PruneNode *node)
+static PruneNode* BooleanDistributeToORofANDs(PruneNode *node)
 {
 	ListCell *cell = NULL;
 
@@ -709,7 +744,7 @@ static PruneNode* BooleanDistributeANDedORs(PruneNode *node)
 			{
 				andNode = lfirst(cell);
 
-				newOr->bools = lappend(newOr->bools, BooleanDistributeANDedORs(andNode));
+				newOr->bools = lappend(newOr->bools, BooleanDistributeToORofANDs(andNode));
 			}
 
 			return newOr;
@@ -720,16 +755,9 @@ static PruneNode* BooleanDistributeANDedORs(PruneNode *node)
 		}
 	}
 
-	if (!andNode->bools || andNode->bools->length == 0)
+	if (!andNode->bools || andNode->bools->length == 0)
 	{
 		return andNode;
-	}
-
-	if (andNode->bools->length == 1)
-	{
-		PruneNode *orNode = linitial(andNode->bools);
-
-		return orNode;
 	}
 
 	PruneNode *newOr = palloc0(sizeof(PruneNode));
@@ -739,7 +767,7 @@ static PruneNode* BooleanDistributeANDedORs(PruneNode *node)
 
 	foreach(cell, andNode->bools)
 	{
-		MakeAnds(newOr, cell);
+		MakeORofAnds(newOr, cell);
 	}
 
 	return newOr;
@@ -757,12 +785,12 @@ static void BooleanPrint2(PruneNode *node, int depth)
 	if (node->boolOp == AND_EXPR)
 	{
 		sprintf(str, "%*s AND conds=%d bools=%d", depth, "", node->conditions ? node->conditions->length : 0, node->bools ? node->bools->length : 0);
-		ereport(DEBUG2, (errmsg(str)));
+		DebugLog(errmsg(str));
 	}
 	else if (node->boolOp == OR_EXPR)
 	{
 		sprintf(str, "%*s OR conds=%d bools=%d", depth, "", node->conditions ? node->conditions->length : 0, node->bools ? node->bools->length : 0);
-		ereport(DEBUG2, (errmsg(str)));
+		DebugLog(errmsg(str));
 	}
 
 	ListCell *cell = NULL;
@@ -785,9 +813,6 @@ PrunableExpressionsWalker2(PruneNode *node, ClauseWalkerContext *context)
 	{
 		return;
 	}
-
-	char *str1 = palloc0(100);
-	char *str2 = palloc0(100);
 
 	ListCell *cell = NULL;
 
@@ -879,8 +904,17 @@ HandleConditionNode(Node *node, ClauseWalkerContext *context)
 	}
 	else if (IsA(node, ScalarArrayOpExpr))
 	{
+		PruningInstance *prune = context->currentPruningInstance;
+
+		if (!prune->addedToPruningInstances)
+		{
+			context->pruningInstances = lappend(context->pruningInstances,
+												prune);
+			prune->addedToPruningInstances = true;
+		}
+
 		ScalarArrayOpExpr *arrayOperatorExpression = (ScalarArrayOpExpr *) node;
-		AddSAOPartitionKeyRestrictionToInstance(context, arrayOperatorExpression);
+		AddSAOPartitionKeyRestrictionToInstance2(context, arrayOperatorExpression);
 	}
 	else
 	{
@@ -1038,6 +1072,70 @@ PrunableExpressionsWalker(Node *node, ClauseWalkerContext *context)
 	}
 
 	return expression_tree_walker(node, PrunableExpressionsWalker, context);
+}
+
+static void
+AddSAOPartitionKeyRestrictionToInstance2(ClauseWalkerContext *context,
+										ScalarArrayOpExpr *arrayOperatorExpression)
+{
+	PruningInstance *prune = context->currentPruningInstance;
+	Node *leftOpExpression = linitial(arrayOperatorExpression->args);
+	Node *strippedLeftOpExpression = strip_implicit_coercions(leftOpExpression);
+	bool usingEqualityOperator = OperatorImplementsEquality(
+		arrayOperatorExpression->opno);
+	Expr *arrayArgument = (Expr *) lsecond(arrayOperatorExpression->args);
+
+	/* checking for partcol = ANY(const, value, s); or partcol IN (const,b,c); */
+	if (usingEqualityOperator && strippedLeftOpExpression != NULL &&
+		equal(strippedLeftOpExpression, context->partitionColumn) &&
+		IsA(arrayArgument, Const))
+	{
+		ArrayType *array = NULL;
+		int16 typlen = 0;
+		bool typbyval = false;
+		char typalign = '\0';
+		Oid elementType = 0;
+		ArrayIterator arrayIterator = NULL;
+		Datum arrayElement = 0;
+		Datum inArray = ((Const *) arrayArgument)->constvalue;
+		bool isNull = false;
+
+		/* check for the NULL right-hand expression*/
+		if (inArray == 0)
+		{
+			return;
+		}
+
+		array = DatumGetArrayTypeP(((Const *) arrayArgument)->constvalue);
+
+		/* get the necessary information from array type to iterate over it */
+		elementType = ARR_ELEMTYPE(array);
+		get_typlenbyvalalign(elementType,
+							 &typlen,
+							 &typbyval,
+							 &typalign);
+
+		/* Iterate over the righthand array of expression */
+		arrayIterator = array_create_iterator(array, 0, NULL);
+		while (array_iterate(arrayIterator, &arrayElement, &isNull))
+		{
+			Const *constElement = makeConst(elementType, -1,
+											DEFAULT_COLLATION_OID, typlen, arrayElement,
+											isNull, typbyval);
+			prune->saoEqualConsts = lappend(prune->saoEqualConsts, constElement);
+
+			prune->hasValidConstraint = true;
+		}
+	}
+
+	/* Since we could not deal with the constraint, add the pruning instance to
+	 * pruning instance list and labeled it as added.
+	 */
+	else if (!prune->addedToPruningInstances)
+	{
+		context->pruningInstances = lappend(context->pruningInstances, prune);
+		prune->addedToPruningInstances = true;
+	}
 }
 
 
@@ -1394,6 +1492,7 @@ PruneOne(DistTableCacheEntry *cacheEntry, ClauseWalkerContext *context,
 		 PruningInstance *prune)
 {
 	ShardInterval *shardInterval = NULL;
+	List *shardIntervals = NULL;
 
 	/* Well, if life always were this easy... */
 	if (prune->evaluatesToFalse)
@@ -1420,6 +1519,31 @@ PruneOne(DistTableCacheEntry *cacheEntry, ClauseWalkerContext *context,
 		{
 			return NIL;
 		}
+
+		shardIntervals = lappend(shardIntervals, shardInterval);
+	}
+
+	if (prune->saoEqualConsts &&
+		!cacheEntry->hasOverlappingShardInterval)
+	{
+		ListCell *cell = NULL;
+
+		foreach(cell, prune->saoEqualConsts)
+		{
+			Const *equalConsts = (Const *)lfirst(cell);
+
+			shardInterval = FindShardInterval(equalConsts->constvalue, cacheEntry);
+
+			if (shardInterval)
+			{
+				shardIntervals = lappend(shardIntervals, shardInterval);
+			}
+		}
+
+		if (!shardIntervals)
+		{
+			return NIL;
+		}
 	}
 
 	/*
@@ -1441,21 +1565,32 @@ PruneOne(DistTableCacheEntry *cacheEntry, ClauseWalkerContext *context,
 		{
 			return NIL;
 		}
-		else if (shardInterval &&
-				 sortedShardIntervalArray[shardIndex]->shardId != shardInterval->shardId)
+
+		if (!shardIntervals)
 		{
+			return list_make1(sortedShardIntervalArray[shardIndex]);
+		}
+
+		List *foundIntervals = NULL;
+		ListCell *cell = NULL;
+
+		foreach(cell, shardIntervals)
+		{
+			shardInterval = (ShardInterval*)lfirst(cell);
+
 			/*
-			 * equalConst based pruning above yielded a different shard than
+			 * equalConst based pruning might yielded a different shard than
 			 * pruning based on pre-hashed equality.  This is useful in case
 			 * of INSERT ... SELECT, where both can occur together (one via
 			 * join/colocation, the other via a plain equality restriction).
 			 */
-			return NIL;
+			if (sortedShardIntervalArray[shardIndex]->shardId == shardInterval->shardId)
+			{
+				foundIntervals = lappend(foundIntervals, sortedShardIntervalArray[shardIndex]);
+			}
 		}
-		else
-		{
-			return list_make1(sortedShardIntervalArray[shardIndex]);
-		}
+
+		return foundIntervals;
 	}
 
 	/*
@@ -1467,18 +1602,23 @@ PruneOne(DistTableCacheEntry *cacheEntry, ClauseWalkerContext *context,
 	 * and a range based restriction for shard boundaries, added by the
 	 * subquery machinery.
 	 */
-	if (shardInterval)
+	if (shardIntervals)
 	{
-		if (context->partitionMethod != DISTRIBUTE_BY_HASH &&
-			ExhaustivePruneOne(shardInterval, context, prune))
+		ListCell *cell = NULL;
+
+		foreach(cell, shardIntervals)
 		{
-			return NIL;
+			ShardInterval *shardInterval = lfirst(cell);
+
+			if (context->partitionMethod != DISTRIBUTE_BY_HASH &&
+				ExhaustivePruneOne(shardInterval, context, prune))
+			{
+				return NIL;
+			}
 		}
-		else
-		{
-			/* no chance to prune further, return */
-			return list_make1(shardInterval);
-		}
+
+		/* no chance to prune further, return */
+		return shardIntervals;
 	}
 
 	/*
@@ -1881,6 +2021,29 @@ ExhaustivePruneOne(ShardInterval *curInterval,
 								curInterval->maxValue) > 0)
 		{
 			return true;
+		}
+	}
+	if (prune->saoEqualConsts)
+	{
+		ListCell *cell = NULL;
+
+		foreach(cell, prune->saoEqualConsts)
+		{
+			compareWith = ((Const *)lfirst(cell))->constvalue;
+
+			if (PerformValueCompare(compareFunctionCall,
+									compareWith,
+									curInterval->minValue) < 0)
+			{
+				return true;
+			}
+
+			if (PerformValueCompare(compareFunctionCall,
+									compareWith,
+									curInterval->maxValue) > 0)
+			{
+				return true;
+			}
 		}
 	}
 	if (prune->greaterEqualConsts)
