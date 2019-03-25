@@ -180,6 +180,15 @@ EXPLAIN SELECT count(*) FROM orders_hash_partitioned
 	
 EXPLAIN SELECT count(*) FROM orders_hash_partitioned
 	WHERE (o_orderkey IN (1,2) AND o_custkey = 3) OR (o_orderkey = 3 AND o_custkey = 4);
+
+EXPLAIN SELECT count(*) FROM orders_hash_partitioned
+	WHERE (o_orderkey IN (1,2)) AND (o_custkey = 1 OR o_custkey = 2) AND o_custkey = 3;
+
+EXPLAIN SELECT count(*) FROM orders_hash_partitioned
+	WHERE ((o_orderkey IN (1,2)) AND (o_custkey = 1 OR o_custkey = 2)) OR o_custkey = 3;
+	
+EXPLAIN SELECT count(*) FROM orders_hash_partitioned
+	WHERE ((o_orderkey IN (1,2)) AND (o_custkey = 1 OR o_custkey = 2)) OR (o_orderkey = 3 AND o_custkey = 3);
 	
 SET client_min_messages TO DEFAULT;
 SET citus.log_shard_pruning TO OFF;

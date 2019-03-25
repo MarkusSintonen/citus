@@ -176,8 +176,8 @@ typedef struct ClauseWalkerContext
 
 bool LogShardPruning = false; /* print shard pruning information as a debugging aid */
 
-static void SeparateBoolFromConditions(PruneNode *node);
 static void PullUpBooleanOps(PruneNode *node, PruneNode *parent);
+static void SeparateOrConditionsFromBools(PruneNode *node);
 static void PrunableExpressions(Node *originalNode, ClauseWalkerContext *context);
 static bool PrunableExpressionsWalker(Node *node, ClauseWalkerContext *context);
 static void PrunableExpressionsWalker2(PruneNode *node, ClauseWalkerContext *context);
@@ -312,8 +312,8 @@ PruneShards(Oid relationId, Index rangeTableId, List *whereClauseList,
 	DebugLog(errmsg("--AFTER PULL UP--"));
 	PullUpBooleanOps(&pruneNode, (PruneNode*)NULL);
 	BooleanPrint(&pruneNode);
-	DebugLog(errmsg("--AFTER SEPARATE--"));
-	SeparateBoolFromConditions(&pruneNode);
+	DebugLog(errmsg("--AFTER SEPARATE OR--"));
+	SeparateOrConditionsFromBools(&pruneNode);
 	BooleanPrint(&pruneNode);
 	DebugLog(errmsg("--AFTER DISTRIBUTION--"));
 	PruneNode* pruneNode3 = BooleanDistributeToORofANDs(&pruneNode);
@@ -631,17 +631,14 @@ static bool IsPullUpBooleanOp(PruneNode *node)
 		return false;
 	}
 
-	int countBools = node->bools ? node->bools->length : 0;
-	int countConditions = node->conditions ? node->conditions->length : 0;
-
-	return (countBools + countConditions) < 2;
+	return (length(node->bools) + length(node->conditions)) < 2;
 }
 
 static void PullUpBooleanOps(PruneNode *node, PruneNode *parent)
 {
 	ListCell *cell = NULL;
 
-	if (node->bools && node->bools->length > 0)
+	if (node->bools)
 	{
 		foreach(cell, node->bools)
 		{
@@ -657,71 +654,91 @@ static void PullUpBooleanOps(PruneNode *node, PruneNode *parent)
 	}
 }
 
-static void SeparateBoolFromConditions(PruneNode *node)
+static void SeparateOrConditionsFromBools(PruneNode *node)
 {
 	ListCell *cell = NULL;
 
-	if (node->bools && node->bools->length > 0)
+	if (node->bools)
 	{
 		foreach(cell, node->bools)
 		{
-			SeparateBoolFromConditions((PruneNode *)lfirst(cell));
+			PullUpBooleanOps((PruneNode *)lfirst(cell), node);
 		}
 	}
 
-	if (node->conditions && node->bools)
+	if (node->boolOp == OR_EXPR && node->conditions)
 	{
 		foreach(cell, node->conditions)
 		{
-			PruneNode *newNode = palloc0(sizeof(PruneNode));
-			newNode->boolOp = node->boolOp == AND_EXPR ? OR_EXPR : AND_EXPR;
-			newNode->conditions = lappend(newNode->conditions, lfirst(cell));
+			PruneNode *newAnd = palloc0(sizeof(PruneNode));
+			newAnd->boolOp = AND_EXPR;
+			newAnd->conditions = lappend(newAnd->conditions, lfirst(cell));
 
-			node->bools = lappend(node->bools, newNode);
+			node->bools = lappend(node->bools, newAnd);
 		}
 
 		node->conditions = NULL;
 	}
 }
 
-static void MakeORofAnds(PruneNode *newOr, ListCell *boolsCell)
+static void MakeORofAnds(PruneNode *newOr, PruneNode *curOr, List *otherOrs, List *andConds)
 {
-	PruneNode *boolNode = lfirst(boolsCell);
-	if (boolNode->boolOp != OR_EXPR)
+	if (curOr->boolOp != OR_EXPR)
 	{
 		return;
 	}
 
-	ListCell *next = lnext(boolsCell);
-	if (!next)
-	{
-		return;
-	}
-
-	PruneNode *boolNode2 = lfirst(next);
-	if (boolNode2->boolOp != OR_EXPR)
+	if (!otherOrs && !andConds)
 	{
 		return;
 	}
 
 	ListCell *cell = NULL;
 	ListCell *cell2 = NULL;
+	ListCell *cell3 = NULL;
 
-	foreach(cell, boolNode->conditions)
+	if (!otherOrs)
 	{
-		Node *cond = lfirst(cell);
-
-		foreach(cell2, boolNode2->conditions)
+		foreach(cell, curOr->conditions)
 		{
-			Node *cond2 = lfirst(cell2);
+			Node *cond = lfirst(cell);
 
 			PruneNode *newAnd = palloc0(sizeof(PruneNode));
 			newAnd->boolOp = AND_EXPR;
 
+			newAnd->conditions = list_copy(andConds);
 			newAnd->conditions = lappend(newAnd->conditions, cond);
-			newAnd->conditions = lappend(newAnd->conditions, cond2);
 
 			newOr->bools = lappend(newOr->bools, newAnd);
+		}
+
+		return;
+	}
+
+	foreach(cell, curOr->conditions)
+	{
+		Node *cond = lfirst(cell);
+
+		foreach(cell2, otherOrs)
+		{
+			PruneNode *otherOr = (PruneNode *)lfirst(cell2);
+
+			foreach(cell3, otherOr->conditions)
+			{
+				Node *cond2 = lfirst(cell3);
+
+				PruneNode *newAnd = palloc0(sizeof(PruneNode));
+				newAnd->boolOp = AND_EXPR;
+
+				if (andConds)
+				{
+					newAnd->conditions = list_copy(andConds);
+				}
+				newAnd->conditions = lappend(newAnd->conditions, cond);
+				newAnd->conditions = lappend(newAnd->conditions, cond2);
+
+				newOr->bools = lappend(newOr->bools, newAnd);
+			}
 		}
 	}
 }
@@ -729,6 +746,7 @@ static void MakeORofAnds(PruneNode *newOr, ListCell *boolsCell)
 static PruneNode* BooleanDistributeToORofANDs(PruneNode *node)
 {
 	ListCell *cell = NULL;
+	ListCell *cell2 = NULL;
 
 	PruneNode *andNode = node->boolOp == AND_EXPR ? node : NULL;
 	PruneNode *orNode = node->boolOp == OR_EXPR ? node : NULL;
@@ -737,17 +755,18 @@ static PruneNode* BooleanDistributeToORofANDs(PruneNode *node)
 	{
 		if (orNode->bools)
 		{
-			PruneNode *newOr = palloc0(sizeof(PruneNode));
-			newOr->boolOp = OR_EXPR;
+			List *asd = NULL;
 
 			foreach(cell, orNode->bools)
 			{
 				andNode = lfirst(cell);
 
-				newOr->bools = lappend(newOr->bools, BooleanDistributeToORofANDs(andNode));
+				asd = list_concat(asd, BooleanDistributeToORofANDs(andNode)->bools);
 			}
 
-			return newOr;
+			orNode->bools = asd;
+
+			return orNode;
 		}
 		else
 		{
@@ -755,22 +774,32 @@ static PruneNode* BooleanDistributeToORofANDs(PruneNode *node)
 		}
 	}
 
-	if (!andNode->bools || andNode->bools->length == 0)
-	{
-		return andNode;
-	}
-
 	PruneNode *newOr = palloc0(sizeof(PruneNode));
 	newOr->boolOp = OR_EXPR;
 
-	/* Iterate OR nodes under the AND node distributing them */
-
-	foreach(cell, andNode->bools)
+	if (andNode->bools)
 	{
-		MakeORofAnds(newOr, cell);
-	}
+		/* Iterate OR nodes under the AND node distributing them */
 
-	return newOr;
+		foreach(cell, andNode->bools)
+		{
+			PruneNode *orNode = (PruneNode*)lfirst(cell);
+
+			MakeORofAnds(newOr, orNode, list_delete_ptr(andNode->bools, orNode), andNode->conditions);
+		}
+
+		return newOr;
+	}
+	else if (andNode->conditions)
+	{
+		newOr->bools = lappend(newOr->bools, andNode);
+
+		return newOr;
+	}
+	else
+	{
+		return newOr;
+	}
 }
 
 static void BooleanPrint2(PruneNode *node, int depth)
@@ -784,12 +813,12 @@ static void BooleanPrint2(PruneNode *node, int depth)
 
 	if (node->boolOp == AND_EXPR)
 	{
-		sprintf(str, "%*s AND conds=%d bools=%d", depth, "", node->conditions ? node->conditions->length : 0, node->bools ? node->bools->length : 0);
+		sprintf(str, "%*s AND conds=%d bools=%d", depth, "", length(node->conditions), length(node->bools));
 		DebugLog(errmsg(str));
 	}
 	else if (node->boolOp == OR_EXPR)
 	{
-		sprintf(str, "%*s OR conds=%d bools=%d", depth, "", node->conditions ? node->conditions->length : 0, node->bools ? node->bools->length : 0);
+		sprintf(str, "%*s OR conds=%d bools=%d", depth, "", length(node->conditions), length(node->bools));
 		DebugLog(errmsg(str));
 	}
 
@@ -1536,7 +1565,7 @@ PruneOne(DistTableCacheEntry *cacheEntry, ClauseWalkerContext *context,
 
 			if (shardInterval)
 			{
-				shardIntervals = lappend(shardIntervals, shardInterval);
+				shardIntervals = list_append_unique_ptr(shardIntervals, shardInterval);
 			}
 		}
 
