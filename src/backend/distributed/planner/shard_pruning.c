@@ -133,6 +133,11 @@ typedef struct PruneNode
 	List *conditions;
 } PruneNode;
 
+typedef struct ConditionWrapper
+{
+	List *validConstraints;
+} ConditionWrapper;
+
 /*
  * Partial instances that need to be finished building.  This is used to
  * collect all ANDed restrictions, before looking into ORed expressions.
@@ -174,6 +179,12 @@ typedef struct ClauseWalkerContext
 	FunctionCallInfoData compareIntervalFunctionCall;
 } ClauseWalkerContext;
 
+typedef struct PruneNodeContext
+{
+	Var *partitionColumn;
+	PruneNode *pruneNode;
+} PruneNodeContext;
+
 bool LogShardPruning = false; /* print shard pruning information as a debugging aid */
 
 static void PullUpBooleanOps(PruneNode *node, PruneNode *parent);
@@ -181,11 +192,15 @@ static void SeparateOrConditionsFromBools(PruneNode *node);
 static void PrunableExpressions(Node *originalNode, ClauseWalkerContext *context);
 static bool PrunableExpressionsWalker(Node *node, ClauseWalkerContext *context);
 static void PrunableExpressionsWalker2(PruneNode *node, ClauseWalkerContext *context);
-static void PrunableExpressions2(PruneNode *node, ClauseWalkerContext *context);
 static void HandleConditionNode(Node *node, ClauseWalkerContext *context);
 static void AddPartitionKeyRestrictionToInstance(ClauseWalkerContext *context,
 												 OpExpr *opClause, Var *varClause,
 												 Const *constantClause);
+static bool IsValidConditionNode(Node *node, Var *partitionColumn);
+static bool IsValidPartitionKeyRestriction(OpExpr *opClause);
+static bool IsValidHashRestriction(OpExpr *opClause);
+static bool IsValidSAOPartitionKeyRestriction(Var *partitionColumn,
+												ScalarArrayOpExpr *arrayOperatorExpression);
 static void AddSAOPartitionKeyRestrictionToInstance(ClauseWalkerContext *context,
 													ScalarArrayOpExpr *
 													arrayOperatorExpression);
@@ -222,7 +237,7 @@ static int LowerShardBoundary(Datum partitionColumnValue,
 							  int shardCount, FunctionCallInfoData *compareFunction,
 							  bool includeMax);
 
-static bool BuildPruneTree(Node *node, PruneNode *pruneNode);
+static bool BuildPruneTree(Node *node, PruneNodeContext *pruneNode);
 static PruneNode* BooleanDistributeToORofANDs(PruneNode *pruneNode);
 static void BooleanPrint(PruneNode *pruneNode);
 
@@ -306,8 +321,11 @@ PruneShards(Oid relationId, Index rangeTableId, List *whereClauseList,
 	/* Build prune tree */
 	PruneNode pruneNode = { 0 };
 	pruneNode.boolOp = AND_EXPR;
+	PruneNodeContext pruneNodeContext = { 0 };
+	pruneNodeContext.partitionColumn = context.partitionColumn;
+	pruneNodeContext.pruneNode = &pruneNode;
 	DebugLog(errmsg("================"));
-	BuildPruneTree((Node *) whereClauseList, &pruneNode);
+	BuildPruneTree((Node *) whereClauseList, &pruneNodeContext);
 	BooleanPrint(&pruneNode);
 	DebugLog(errmsg("--AFTER PULL UP--"));
 	PullUpBooleanOps(&pruneNode, (PruneNode*)NULL);
@@ -324,7 +342,7 @@ PruneShards(Oid relationId, Index rangeTableId, List *whereClauseList,
 	//PrunableExpressions((Node *) whereClauseList, &context);
 
 	/* Figure out what we can prune on */
-	PrunableExpressions2(pruneNode3, &context);
+	PrunableExpressionsWalker2(pruneNode3, &context);
 
 	/*
 	 * Prune using each of the PrunableInstances we found, and OR results
@@ -408,6 +426,8 @@ PruneShards(Oid relationId, Index rangeTableId, List *whereClauseList,
 			}
 		}
 
+		DebugLog(errmsg("equalConsts=%d", prune->equalConsts ? prune->equalConsts->constvalue : -1));
+		DebugLog(errmsg("hashedEqualConsts=%d", prune->hashedEqualConsts ? prune->hashedEqualConsts->constvalue : -1));
 		pruneOneList = PruneOne(cacheEntry, &context, prune);
 
 		if (prunedList)
@@ -452,6 +472,7 @@ PruneShards(Oid relationId, Index rangeTableId, List *whereClauseList,
 	 * Deep copy list, so it's independent of the DistTableCacheEntry
 	 * contents.
 	 */
+	DebugLog(errmsg("prunedList=%d", list_length(prunedList)));
 	return DeepCopyShardIntervalList(prunedList);
 }
 
@@ -482,54 +503,6 @@ ContainsFalseClause(List *whereClauseList)
 	}
 
 	return containsFalseClause;
-}
-
-static void
-PrunableExpressions2(PruneNode *node, ClauseWalkerContext *context)
-{
-	/*
-	 * Build initial list of prunable expressions.  As long as only,
-	 * implicitly or explicitly, ANDed expressions are found, this perform a
-	 * depth-first search.  When an ORed expression is found, the current
-	 * PruningInstance is added to context->pruningInstances (once for each
-	 * ORed expression), then the tree-traversal is continued without
-	 * recursing.  Once at the top-level again, we'll process all pending
-	 * expressions - that allows us to find all ANDed expressions, before
-	 * recursing into an ORed expression.
-	 */
-	PrunableExpressionsWalker2(node, context);
-
-	/*
-	 * Process all pending instances.  While processing, new ones might be
-	 * added to the list, so don't use foreach().
-	 *
-	 * Check the places in PruningInstanceWalker that push onto
-	 * context->pendingInstances why construction of the PruningInstance might
-	 * be pending.
-	 *
-	 * We copy the partial PruningInstance, and continue adding information by
-	 * calling PrunableExpressionsWalker() on the copy, continuing at the the
-	 * node stored in PendingPruningInstance->continueAt.
-	 */
-	while (context->pendingInstances != NIL)
-	{
-		PendingPruningInstance *instance =
-			(PendingPruningInstance *) linitial(context->pendingInstances);
-		PruningInstance *newPrune = CopyPartialPruningInstance(instance->instance);
-
-		context->pendingInstances = list_delete_first(context->pendingInstances);
-
-		context->currentPruningInstance = newPrune;
-		if (instance->continueAtPruneNode)
-		{
-			PrunableExpressionsWalker2(instance->continueAtPruneNode, context);
-		}
-		if (instance->continueAt)
-		{
-			PrunableExpressionsWalker(instance->continueAt, context);
-		}
-		context->currentPruningInstance = NULL;
-	}
 }
 
 /*
@@ -577,7 +550,96 @@ PrunableExpressions(Node *node, ClauseWalkerContext *context)
 	}
 }
 
-static bool BuildPruneTree(Node *node, PruneNode *pruneNode)
+static ConditionWrapper* FindValidConditionWrapper(List *conditions)
+{
+	ListCell *cell = NULL;
+
+	foreach(cell, conditions)
+	{
+		ConditionWrapper *conditionWrapper = lfirst(cell);
+		if (conditionWrapper->validConstraints)
+		{
+			return conditionWrapper;
+		}
+	}
+
+	return NULL;
+}
+
+static ConditionWrapper* FindInvalidConditionWrapper(List *conditions)
+{
+	ListCell *cell = NULL;
+
+	foreach(cell, conditions)
+	{
+		ConditionWrapper *conditionWrapper = lfirst(cell);
+		if (!conditionWrapper->validConstraints)
+		{
+			return conditionWrapper;
+		}
+	}
+
+	return NULL;
+}
+
+static List* AppendConstraint(List *conditions, Node *validConstraint)
+{
+	ConditionWrapper *invalidConditionWrapper = FindInvalidConditionWrapper(conditions);
+	ConditionWrapper *validConditionWrapper = FindValidConditionWrapper(conditions);
+
+	if (invalidConditionWrapper && validConditionWrapper)
+	{
+		if (validConstraint)
+		{
+			validConditionWrapper->validConstraints = lappend(validConditionWrapper->validConstraints, validConstraint);
+		}
+
+		return conditions;
+	}
+	else if (invalidConditionWrapper)
+	{
+		if (validConstraint)
+		{
+			ConditionWrapper *conditionWrapper = palloc0(sizeof(ConditionWrapper));
+			conditionWrapper->validConstraints = lappend(conditionWrapper->validConstraints, validConstraint);
+			conditions = lappend(conditions, conditionWrapper);
+		}
+
+		return conditions;
+	}
+	else if (validConditionWrapper)
+	{
+		if (validConstraint)
+		{
+			validConditionWrapper->validConstraints = lappend(validConditionWrapper->validConstraints, validConstraint);
+		}
+		else
+		{
+			ConditionWrapper *conditionWrapper = palloc0(sizeof(ConditionWrapper));
+			conditionWrapper->validConstraints = NULL;
+			conditions = lappend(conditions, conditionWrapper);
+		}
+
+		return conditions;
+	}
+	else
+	{
+		ConditionWrapper *conditionWrapper = palloc0(sizeof(ConditionWrapper));
+
+		if (validConstraint)
+		{
+			conditionWrapper->validConstraints = lappend(conditionWrapper->validConstraints, validConstraint);
+		}
+		else
+		{
+			conditionWrapper->validConstraints = NULL;
+		}
+
+		return lappend(conditions, conditionWrapper);
+	}
+}
+
+static bool BuildPruneTree(Node *node, PruneNodeContext *context)
 {
 	if (node == NULL)
 	{
@@ -599,20 +661,48 @@ static bool BuildPruneTree(Node *node, PruneNode *pruneNode)
 		{
 			return false;
 		}
-		else if (boolExpr->boolop != pruneNode->boolOp)
+		else if (boolExpr->boolop != context->pruneNode->boolOp)
 		{
 			PruneNode *newNode = palloc0(sizeof(PruneNode));
 			newNode->boolOp = boolExpr->boolop;
 
-			pruneNode->bools = lappend(pruneNode->bools, newNode);
+			context->pruneNode->bools = lappend(context->pruneNode->bools, newNode);
+
+			PruneNodeContext newContext = { 0 };
+			newContext.partitionColumn = context->partitionColumn;
+			newContext.pruneNode = newNode;
 
 			return expression_tree_walker((Node *) boolExpr->args,
-					BuildPruneTree, newNode);
+					BuildPruneTree, &newContext);
 		}
 	}
 	else if (IsA(node, OpExpr) || IsA(node, ScalarArrayOpExpr))
 	{
-		pruneNode->conditions = lappend(pruneNode->conditions, node);
+		if (context->pruneNode->boolOp == AND_EXPR)
+		{
+			if (IsValidConditionNode(node, context->partitionColumn))
+			{
+				context->pruneNode->conditions = AppendConstraint(context->pruneNode->conditions, node);
+			}
+			else
+			{
+				context->pruneNode->conditions = AppendConstraint(context->pruneNode->conditions, NULL);
+			}
+		}
+		else
+		{
+			if (IsValidConditionNode(node, context->partitionColumn))
+			{
+				ConditionWrapper *conditionWrapper = palloc0(sizeof(ConditionWrapper));
+				conditionWrapper->validConstraints = lappend(conditionWrapper->validConstraints, node);
+
+				context->pruneNode->conditions = lappend(context->pruneNode->conditions, conditionWrapper);
+			}
+			else
+			{
+				context->pruneNode->conditions = AppendConstraint(context->pruneNode->conditions, NULL);
+			}
+		}
 
 		return false;
 	}
@@ -621,7 +711,7 @@ static bool BuildPruneTree(Node *node, PruneNode *pruneNode)
 		return false;
 	}
 
-	return expression_tree_walker(node, BuildPruneTree, pruneNode);
+	return expression_tree_walker(node, BuildPruneTree, context);
 }
 
 static bool IsPullUpBooleanOp(PruneNode *node)
@@ -631,7 +721,7 @@ static bool IsPullUpBooleanOp(PruneNode *node)
 		return false;
 	}
 
-	return (length(node->bools) + length(node->conditions)) < 2;
+	return (list_length(node->bools) + list_length(node->conditions)) < 2;
 }
 
 static void PullUpBooleanOps(PruneNode *node, PruneNode *parent)
@@ -701,7 +791,7 @@ static void MakeORofAnds(PruneNode *newOr, PruneNode *curOr, List *otherOrs, Lis
 	{
 		foreach(cell, curOr->conditions)
 		{
-			Node *cond = lfirst(cell);
+			ConditionWrapper *cond = lfirst(cell);
 
 			PruneNode *newAnd = palloc0(sizeof(PruneNode));
 			newAnd->boolOp = AND_EXPR;
@@ -717,7 +807,7 @@ static void MakeORofAnds(PruneNode *newOr, PruneNode *curOr, List *otherOrs, Lis
 
 	foreach(cell, curOr->conditions)
 	{
-		Node *cond = lfirst(cell);
+		ConditionWrapper *cond = lfirst(cell);
 
 		foreach(cell2, otherOrs)
 		{
@@ -725,7 +815,7 @@ static void MakeORofAnds(PruneNode *newOr, PruneNode *curOr, List *otherOrs, Lis
 
 			foreach(cell3, otherOr->conditions)
 			{
-				Node *cond2 = lfirst(cell3);
+				ConditionWrapper *cond2 = lfirst(cell3);
 
 				PruneNode *newAnd = palloc0(sizeof(PruneNode));
 				newAnd->boolOp = AND_EXPR;
@@ -746,7 +836,6 @@ static void MakeORofAnds(PruneNode *newOr, PruneNode *curOr, List *otherOrs, Lis
 static PruneNode* BooleanDistributeToORofANDs(PruneNode *node)
 {
 	ListCell *cell = NULL;
-	ListCell *cell2 = NULL;
 
 	PruneNode *andNode = node->boolOp == AND_EXPR ? node : NULL;
 	PruneNode *orNode = node->boolOp == OR_EXPR ? node : NULL;
@@ -809,20 +898,29 @@ static void BooleanPrint2(PruneNode *node, int depth)
 		return;
 	}
 
+	int numValid = 0;
+	int numInvalid = 0;
+	ListCell *cell = NULL;
+
+	foreach(cell, node->conditions)
+	{
+		ConditionWrapper *conditionWrapper = lfirst(cell);
+		if (conditionWrapper->validConstraints)
+		{
+			numValid += list_length(conditionWrapper->validConstraints);
+		}
+		else
+		{
+			numInvalid++;
+		}
+	}
+
+	char *op = node->boolOp == AND_EXPR ? "AND" : "OR";
 	char *str = palloc0(100);
 
-	if (node->boolOp == AND_EXPR)
-	{
-		sprintf(str, "%*s AND conds=%d bools=%d", depth, "", length(node->conditions), length(node->bools));
-		DebugLog(errmsg(str));
-	}
-	else if (node->boolOp == OR_EXPR)
-	{
-		sprintf(str, "%*s OR conds=%d bools=%d", depth, "", length(node->conditions), length(node->bools));
-		DebugLog(errmsg(str));
-	}
+	sprintf(str, "%*s %s valid_conds=%d invalid_conds=%s", depth, "", op, numValid, numInvalid > 0 ? "TRUE" : "FALSE");
+	DebugLog(errmsg(str));
 
-	ListCell *cell = NULL;
 	foreach(cell, node->bools)
 	{
 		PruneNode *boolNode = lfirst(cell);
@@ -844,6 +942,7 @@ PrunableExpressionsWalker2(PruneNode *node, ClauseWalkerContext *context)
 	}
 
 	ListCell *cell = NULL;
+	ListCell *cell2 = NULL;
 
 	if (node->boolOp == AND_EXPR)
 	{
@@ -852,24 +951,102 @@ PrunableExpressionsWalker2(PruneNode *node, ClauseWalkerContext *context)
 			PruneNode *boolNode = lfirst(cell);
 			PrunableExpressionsWalker2(boolNode, context);
 		}
-		foreach(cell, node->conditions)
+
+		ConditionWrapper *validCondWrapper = FindValidConditionWrapper(node->conditions);
+		ConditionWrapper *invalidCondWrapper = FindInvalidConditionWrapper(node->conditions);
+
+		if (invalidCondWrapper && !validCondWrapper)
 		{
-			Node *cond = lfirst(cell);
-			HandleConditionNode(cond, context);
+			PruningInstance *newInstance = palloc0(sizeof(PruningInstance));
+			newInstance->addedToPruningInstances = true;
+			newInstance->isPartial = false;
+			newInstance->hasValidConstraint = false;
+
+			context->pruningInstances = lappend(context->pruningInstances, newInstance);
+		}
+		else if (validCondWrapper)
+		{
+			PruningInstance *newInstance = palloc0(sizeof(PruningInstance));
+			newInstance->addedToPruningInstances = false;
+			newInstance->isPartial = false;
+
+			context->currentPruningInstance = newInstance;
+
+			foreach(cell, node->conditions)
+			{
+				ConditionWrapper *conditionWrapper = lfirst(cell);
+
+				foreach(cell2, conditionWrapper->validConstraints)
+				{
+					HandleConditionNode((Node*)lfirst(cell2), context);
+				}
+			}
 		}
 	}
 	else
 	{
+		Assert(node->boolOp == OR_EXPR);
+		Assert(!node->conditions);
+
 		foreach(cell, node->bools)
 		{
 			PruneNode *boolNode = lfirst(cell);
-			AddNewConjuction2(context, boolNode);
+			PrunableExpressionsWalker2(boolNode, context);
 		}
-		foreach(cell, node->conditions)
+	}
+}
+
+static bool
+IsValidConditionNode(Node *node, Var *partitionColumn)
+{
+	if (IsA(node, OpExpr))
+	{
+		OpExpr *opClause = (OpExpr *) node;
+		Node *leftOperand = NULL;
+		Node *rightOperand = NULL;
+		Const *constantClause = NULL;
+		Var *varClause = NULL;
+
+		if (list_length(opClause->args) == 2)
 		{
-			Node *cond = lfirst(cell);
-			AddNewConjuction(context, (OpExpr*)cond);
+			leftOperand = get_leftop((Expr *) opClause);
+			rightOperand = get_rightop((Expr *) opClause);
+
+			leftOperand = strip_implicit_coercions(leftOperand);
+			rightOperand = strip_implicit_coercions(rightOperand);
+
+			if (IsA(rightOperand, Const) && IsA(leftOperand, Var))
+			{
+				constantClause = (Const *) rightOperand;
+				varClause = (Var *) leftOperand;
+			}
+			else if (IsA(leftOperand, Const) && IsA(rightOperand, Var))
+			{
+				constantClause = (Const *) leftOperand;
+				varClause = (Var *) rightOperand;
+			}
 		}
+
+		if (constantClause && varClause && equal(varClause, partitionColumn))
+		{
+			return IsValidPartitionKeyRestriction(opClause);
+		}
+		else if (constantClause && varClause &&
+				 varClause->varattno == RESERVED_HASHED_COLUMN_ID)
+		{
+			return IsValidHashRestriction(opClause);
+		}
+
+		return false;
+	}
+	else if (IsA(node, ScalarArrayOpExpr))
+	{
+		ScalarArrayOpExpr *arrayOperatorExpression = (ScalarArrayOpExpr *) node;
+		return IsValidSAOPartitionKeyRestriction(partitionColumn, arrayOperatorExpression);
+	}
+	else
+	{
+		return false;
 	}
 }
 
@@ -914,6 +1091,7 @@ HandleConditionNode(Node *node, ClauseWalkerContext *context)
 
 		if (constantClause && varClause && equal(varClause, context->partitionColumn))
 		{
+			DebugLog(errmsg("AddPartitionKeyRestrictionToInstance=%d", constantClause->constvalue));
 			/*
 			 * Found a restriction on the partition column itself. Update the
 			 * current constraint with the new information.
@@ -924,6 +1102,7 @@ HandleConditionNode(Node *node, ClauseWalkerContext *context)
 		else if (constantClause && varClause &&
 				 varClause->varattno == RESERVED_HASHED_COLUMN_ID)
 		{
+			DebugLog(errmsg("AddHashRestrictionToInstance=%d", constantClause->constvalue));
 			/*
 			 * Found restriction that directly specifies the boundaries of a
 			 * hashed column.
@@ -1056,6 +1235,7 @@ PrunableExpressionsWalker(Node *node, ClauseWalkerContext *context)
 
 		if (constantClause && varClause && equal(varClause, context->partitionColumn))
 		{
+			DebugLog(errmsg("AddPartitionKeyRestrictionToInstance=%d", constantClause->constvalue));
 			/*
 			 * Found a restriction on the partition column itself. Update the
 			 * current constraint with the new information.
@@ -1066,6 +1246,7 @@ PrunableExpressionsWalker(Node *node, ClauseWalkerContext *context)
 		else if (constantClause && varClause &&
 				 varClause->varattno == RESERVED_HASHED_COLUMN_ID)
 		{
+			DebugLog(errmsg("AddHashRestrictionToInstance=%d", constantClause->constvalue));
 			/*
 			 * Found restriction that directly specifies the boundaries of a
 			 * hashed column.
@@ -1102,6 +1283,36 @@ PrunableExpressionsWalker(Node *node, ClauseWalkerContext *context)
 
 	return expression_tree_walker(node, PrunableExpressionsWalker, context);
 }
+
+
+static bool
+IsValidSAOPartitionKeyRestriction(Var *partitionColumn, ScalarArrayOpExpr *arrayOperatorExpression)
+{
+	Node *leftOpExpression = linitial(arrayOperatorExpression->args);
+	Node *strippedLeftOpExpression = strip_implicit_coercions(leftOpExpression);
+	bool usingEqualityOperator = OperatorImplementsEquality(
+		arrayOperatorExpression->opno);
+	Expr *arrayArgument = (Expr *) lsecond(arrayOperatorExpression->args);
+
+	/* checking for partcol = ANY(const, value, s); or partcol IN (const,b,c); */
+	if (usingEqualityOperator && strippedLeftOpExpression != NULL &&
+		equal(strippedLeftOpExpression, partitionColumn) &&
+		IsA(arrayArgument, Const))
+	{
+		Datum inArray = ((Const *) arrayArgument)->constvalue;
+
+		/* check for the NULL right-hand expression*/
+		if (inArray == 0)
+		{
+			return false;
+		}
+
+		return true;
+	}
+
+	return false;
+}
+
 
 static void
 AddSAOPartitionKeyRestrictionToInstance2(ClauseWalkerContext *context,
@@ -1289,6 +1500,32 @@ AddNewConjuction2(ClauseWalkerContext *context, PruneNode *pruneNode)
 }
 
 
+static bool
+IsValidPartitionKeyRestriction(OpExpr *opClause)
+{
+	List *btreeInterpretationList = NULL;
+	ListCell *btreeInterpretationCell = NULL;
+	bool matchedOp = false;
+
+	btreeInterpretationList =
+		get_op_btree_interpretation(opClause->opno);
+	foreach(btreeInterpretationCell, btreeInterpretationList)
+	{
+		OpBtreeInterpretation *btreeInterpretation =
+			(OpBtreeInterpretation *) lfirst(btreeInterpretationCell);
+
+		if (btreeInterpretation->strategy == ROWCOMPARE_NE)
+		{
+			return false;
+		}
+
+		matchedOp = true;
+	}
+
+	return matchedOp;
+}
+
+
 /*
  * AddPartitionKeyRestrictionToInstance adds information about a PartitionKey
  * $op Const restriction to the current pruning instance.
@@ -1402,6 +1639,29 @@ AddPartitionKeyRestrictionToInstance(ClauseWalkerContext *context, OpExpr *opCla
 	{
 		prune->hasValidConstraint = true;
 	}
+}
+
+
+static bool
+IsValidHashRestriction(OpExpr *opClause)
+{
+	List *btreeInterpretationList = NULL;
+	ListCell *btreeInterpretationCell = NULL;
+
+	btreeInterpretationList =
+		get_op_btree_interpretation(opClause->opno);
+	foreach(btreeInterpretationCell, btreeInterpretationList)
+	{
+		OpBtreeInterpretation *btreeInterpretation =
+			(OpBtreeInterpretation *) lfirst(btreeInterpretationCell);
+
+		if (btreeInterpretation->strategy == BTGreaterEqualStrategyNumber)
+		{
+			return true;
+		}
+	}
+
+	return false;
 }
 
 
