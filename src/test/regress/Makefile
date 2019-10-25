@@ -59,6 +59,14 @@ check-multi: all tempinstall-main
 	$(pg_regress_multi_check) --load-extension=citus \
 	-- $(MULTI_REGRESS_OPTS) --schedule=$(citus_abs_srcdir)/multi_schedule $(EXTRA_TESTS)
 
+check-multi2: all tempinstall-main
+	$(pg_regress_multi_check) --load-extension=citus \
+	-- $(MULTI_REGRESS_OPTS) --schedule=$(citus_abs_srcdir)/multi_schedule2 $(EXTRA_TESTS)
+
+check-test: all tempinstall-main
+	$(pg_regress_multi_check) --load-extension=citus \
+	-- $(MULTI_REGRESS_OPTS) --schedule=$(citus_abs_srcdir)/test $(EXTRA_TESTS)
+
 check-multi-vg: all tempinstall-main
 	$(pg_regress_multi_check) --load-extension=citus --valgrind \
 	--pg_ctl-timeout=360 --connection-timeout=500000 --valgrind-path=valgrind --valgrind-log-file=$(VALGRIND_LOG_FILE) \

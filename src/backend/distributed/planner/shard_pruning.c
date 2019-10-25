@@ -426,8 +426,6 @@ PruneShards(Oid relationId, Index rangeTableId, List *whereClauseList,
 			}
 		}
 
-		DebugLog(errmsg("equalConsts=%d", prune->equalConsts ? prune->equalConsts->constvalue : -1));
-		DebugLog(errmsg("hashedEqualConsts=%d", prune->hashedEqualConsts ? prune->hashedEqualConsts->constvalue : -1));
 		pruneOneList = PruneOne(cacheEntry, &context, prune);
 
 		if (prunedList)
@@ -472,7 +470,6 @@ PruneShards(Oid relationId, Index rangeTableId, List *whereClauseList,
 	 * Deep copy list, so it's independent of the DistTableCacheEntry
 	 * contents.
 	 */
-	DebugLog(errmsg("prunedList=%d", list_length(prunedList)));
 	return DeepCopyShardIntervalList(prunedList);
 }
 
@@ -752,7 +749,7 @@ static void SeparateOrConditionsFromBools(PruneNode *node)
 	{
 		foreach(cell, node->bools)
 		{
-			PullUpBooleanOps((PruneNode *)lfirst(cell), node);
+			SeparateOrConditionsFromBools((PruneNode *)lfirst(cell));
 		}
 	}
 
@@ -771,25 +768,21 @@ static void SeparateOrConditionsFromBools(PruneNode *node)
 	}
 }
 
-static void MakeORofAnds(PruneNode *newOr, PruneNode *curOr, List *otherOrs, List *andConds)
+static List* MakeORofAnds(List *otherOrs, List *orConds, List *andConds)
 {
-	if (curOr->boolOp != OR_EXPR)
-	{
-		return;
-	}
-
 	if (!otherOrs && !andConds)
 	{
-		return;
+		return NULL;
 	}
 
+	List *bools = NULL;
 	ListCell *cell = NULL;
 	ListCell *cell2 = NULL;
 	ListCell *cell3 = NULL;
 
 	if (!otherOrs)
 	{
-		foreach(cell, curOr->conditions)
+		foreach(cell, orConds)
 		{
 			ConditionWrapper *cond = lfirst(cell);
 
@@ -799,13 +792,13 @@ static void MakeORofAnds(PruneNode *newOr, PruneNode *curOr, List *otherOrs, Lis
 			newAnd->conditions = list_copy(andConds);
 			newAnd->conditions = lappend(newAnd->conditions, cond);
 
-			newOr->bools = lappend(newOr->bools, newAnd);
+			bools = lappend(bools, newAnd);
 		}
 
-		return;
+		return bools;
 	}
 
-	foreach(cell, curOr->conditions)
+	foreach(cell, orConds)
 	{
 		ConditionWrapper *cond = lfirst(cell);
 
@@ -827,13 +820,37 @@ static void MakeORofAnds(PruneNode *newOr, PruneNode *curOr, List *otherOrs, Lis
 				newAnd->conditions = lappend(newAnd->conditions, cond);
 				newAnd->conditions = lappend(newAnd->conditions, cond2);
 
-				newOr->bools = lappend(newOr->bools, newAnd);
+				bools = lappend(bools, newAnd);
 			}
 		}
 	}
+
+	return bools;
 }
 
-static PruneNode* BooleanDistributeToORofANDs(PruneNode *node)
+static bool ConstainsORLeaf(PruneNode *node)
+{
+	if (node->boolOp == OR_EXPR && !node->bools)
+	{
+		return true;
+	}
+
+	ListCell *cell = NULL;
+
+	foreach(cell, node->bools)
+	{
+		PruneNode *child = lfirst(cell);
+
+		if (ConstainsORLeaf(child))
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static PruneNode* OneBooleanDistributeToORofANDs(PruneNode *node)
 {
 	ListCell *cell = NULL;
 
@@ -842,6 +859,8 @@ static PruneNode* BooleanDistributeToORofANDs(PruneNode *node)
 
 	if (orNode)
 	{
+		Assert(!orNode->conditions);
+
 		if (orNode->bools)
 		{
 			List *asd = NULL;
@@ -850,7 +869,7 @@ static PruneNode* BooleanDistributeToORofANDs(PruneNode *node)
 			{
 				andNode = lfirst(cell);
 
-				asd = list_concat(asd, BooleanDistributeToORofANDs(andNode)->bools);
+				asd = list_concat(asd, OneBooleanDistributeToORofANDs(andNode)->bools);
 			}
 
 			orNode->bools = asd;
@@ -874,7 +893,8 @@ static PruneNode* BooleanDistributeToORofANDs(PruneNode *node)
 		{
 			PruneNode *orNode = (PruneNode*)lfirst(cell);
 
-			MakeORofAnds(newOr, orNode, list_delete_ptr(andNode->bools, orNode), andNode->conditions);
+			newOr->bools = MakeORofAnds(list_delete_ptr(andNode->bools, orNode), orNode->conditions, andNode->conditions);
+			newOr->bools = list_concat(newOr->bools, orNode->bools);
 		}
 
 		return newOr;
@@ -889,6 +909,17 @@ static PruneNode* BooleanDistributeToORofANDs(PruneNode *node)
 	{
 		return newOr;
 	}
+}
+
+static PruneNode* BooleanDistributeToORofANDs(PruneNode *node)
+{
+	bool needsContinue = false;
+	do
+	{
+		node = OneBooleanDistributeToORofANDs(node);
+		needsContinue = node->boolOp == AND_EXPR && ConstainsORLeaf(node);
+	} while(false);
+	return node;
 }
 
 static void BooleanPrint2(PruneNode *node, int depth)
@@ -915,7 +946,7 @@ static void BooleanPrint2(PruneNode *node, int depth)
 		}
 	}
 
-	char *op = node->boolOp == AND_EXPR ? "AND" : "OR";
+	char *op = node->boolOp == AND_EXPR ? "AND" : "OR ";
 	char *str = palloc0(100);
 
 	sprintf(str, "%*s %s valid_conds=%d invalid_conds=%s", depth, "", op, numValid, numInvalid > 0 ? "TRUE" : "FALSE");
@@ -1091,7 +1122,6 @@ HandleConditionNode(Node *node, ClauseWalkerContext *context)
 
 		if (constantClause && varClause && equal(varClause, context->partitionColumn))
 		{
-			DebugLog(errmsg("AddPartitionKeyRestrictionToInstance=%d", constantClause->constvalue));
 			/*
 			 * Found a restriction on the partition column itself. Update the
 			 * current constraint with the new information.
@@ -1102,7 +1132,6 @@ HandleConditionNode(Node *node, ClauseWalkerContext *context)
 		else if (constantClause && varClause &&
 				 varClause->varattno == RESERVED_HASHED_COLUMN_ID)
 		{
-			DebugLog(errmsg("AddHashRestrictionToInstance=%d", constantClause->constvalue));
 			/*
 			 * Found restriction that directly specifies the boundaries of a
 			 * hashed column.
@@ -1235,7 +1264,6 @@ PrunableExpressionsWalker(Node *node, ClauseWalkerContext *context)
 
 		if (constantClause && varClause && equal(varClause, context->partitionColumn))
 		{
-			DebugLog(errmsg("AddPartitionKeyRestrictionToInstance=%d", constantClause->constvalue));
 			/*
 			 * Found a restriction on the partition column itself. Update the
 			 * current constraint with the new information.
@@ -1246,7 +1274,6 @@ PrunableExpressionsWalker(Node *node, ClauseWalkerContext *context)
 		else if (constantClause && varClause &&
 				 varClause->varattno == RESERVED_HASHED_COLUMN_ID)
 		{
-			DebugLog(errmsg("AddHashRestrictionToInstance=%d", constantClause->constvalue));
 			/*
 			 * Found restriction that directly specifies the boundaries of a
 			 * hashed column.
